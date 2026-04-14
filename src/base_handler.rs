@@ -54,6 +54,26 @@ where
         map_fn: F,
         mode: FetchMode,
     },
+    /// Arrow columnar query — returns `Vec<RecordBatch>`.
+    Arrow {
+        query: &'a str,
+        params: Vec<DuckParam>,
+    },
+}
+
+#[cfg(feature = "duckdb")]
+type NoopMapFn = fn(&duckdb::Row<'_>) -> Result<(), DbkitError>;
+
+#[cfg(feature = "duckdb")]
+impl<'a> ReadOp<'a, (), NoopMapFn> {
+    /// Convenience constructor for Arrow reads without needing type annotations.
+    ///
+    /// ```ignore
+    /// handler.execute_read(ReadOp::arrow("SELECT * FROM t", vec![])).await?.arrow()?
+    /// ```
+    pub fn arrow(query: &'a str, params: Vec<DuckParam>) -> Self {
+        ReadOp::Arrow { query, params }
+    }
 }
 
 /// DuckDB parameter types (including optional variants).
@@ -132,6 +152,7 @@ impl<T> QueryResult<T> {
 #[cfg(feature = "duckdb")]
 pub enum ReadResult<T> {
     Standard(QueryResult<T>),
+    Arrow(Vec<RecordBatch>),
 }
 
 #[cfg(feature = "duckdb")]
@@ -139,6 +160,20 @@ impl<T> ReadResult<T> {
     pub fn standard(self) -> Result<QueryResult<T>, DbkitError> {
         match self {
             Self::Standard(qr) => Ok(qr),
+            _ => Err(DbkitError::RowCount {
+                expected: "Standard".into(),
+                actual: 0,
+            }),
+        }
+    }
+
+    pub fn arrow(self) -> Result<Vec<RecordBatch>, DbkitError> {
+        match self {
+            Self::Arrow(batches) => Ok(batches),
+            _ => Err(DbkitError::RowCount {
+                expected: "Arrow".into(),
+                actual: 0,
+            }),
         }
     }
 }
@@ -394,47 +429,35 @@ impl BaseHandler {
 
                 Ok(ReadResult::Standard(query_result))
             }
+
+            ReadOp::Arrow { query, params } => {
+                let query = query.to_string();
+                let params = params.clone();
+
+                let batches = task::spawn_blocking(move || {
+                    let conn = duck_conn
+                        .lock()
+                        .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
+                    let mut stmt = conn
+                        .prepare(&query)
+                        .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
+
+                    let duck_values = Self::convert_params(&params);
+                    let param_refs: Vec<&dyn duckdb::ToSql> =
+                        duck_values.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+
+                    let arrow_iter = stmt
+                        .query_arrow(param_refs.as_slice())
+                        .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
+
+                    Ok::<Vec<RecordBatch>, DbkitError>(arrow_iter.collect())
+                })
+                .await
+                .map_err(|e| DbkitError::TaskJoin(e.to_string()))??;
+
+                Ok(ReadResult::Arrow(batches))
+            }
         }
-    }
-
-    // ==================== ARROW READ ====================
-
-    /// Execute a query against DuckDB and return results as Arrow RecordBatches.
-    #[cfg(feature = "duckdb")]
-    pub async fn execute_arrow(
-        &self,
-        query: &str,
-        params: &[DuckParam],
-    ) -> Result<Vec<RecordBatch>, DbkitError> {
-        let duck_conn = self
-            .duck_conn
-            .as_ref()
-            .ok_or(DbkitError::DuckDbNotInitialized)?
-            .clone();
-
-        let query = query.to_string();
-        let params = params.to_vec();
-
-        task::spawn_blocking(move || {
-            let conn = duck_conn
-                .lock()
-                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
-            let mut stmt = conn
-                .prepare(&query)
-                .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-            let duck_values = Self::convert_params(&params);
-            let param_refs: Vec<&dyn duckdb::ToSql> =
-                duck_values.iter().map(|v| v as &dyn duckdb::ToSql).collect();
-
-            let arrow_iter = stmt
-                .query_arrow(param_refs.as_slice())
-                .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-            Ok(arrow_iter.collect())
-        })
-        .await
-        .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
     }
 
     // ==================== SYNC (PG -> DuckDB) ====================
