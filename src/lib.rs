@@ -43,7 +43,7 @@ pub use initialization::InitializationHandler;
 
 // DuckDB types only available with the feature
 #[cfg(feature = "duckdb")]
-pub use base_handler::{DuckParam, ReadOp, ReadResult};
+pub use base_handler::{DuckParam, ReadOp, ReadResult, RecordBatch};
 
 // Re-export key types users will need
 pub use deadpool_postgres::Pool;

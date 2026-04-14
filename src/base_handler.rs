@@ -10,6 +10,10 @@ use tokio::task;
 use tokio_postgres::Row as PgRow;
 use tokio_postgres::types::ToSql;
 use tracing::warn;
+use unicode_normalization::UnicodeNormalization;
+
+#[cfg(feature = "duckdb")]
+pub use duckdb::arrow::record_batch::RecordBatch;
 
 // ---------------------------------------------------------------------------
 // Write operations (Postgres)
@@ -52,7 +56,7 @@ where
     },
 }
 
-/// DuckDB parameter types.
+/// DuckDB parameter types (including optional variants).
 #[cfg(feature = "duckdb")]
 #[derive(Debug, Clone)]
 pub enum DuckParam {
@@ -62,6 +66,11 @@ pub enum DuckParam {
     Text(String),
     Bool(bool),
     Null,
+    OptInt(Option<i32>),
+    OptInt64(Option<i64>),
+    OptFloat(Option<f64>),
+    OptText(Option<String>),
+    OptBool(Option<bool>),
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +212,12 @@ impl BaseHandler {
     /// Get a reference to the Postgres pool.
     pub fn pool(&self) -> &Arc<Pool> {
         &self.pg_pool
+    }
+
+    /// Unicode NFD normalization — decomposes characters then lowercases.
+    /// Useful for matching names with different Unicode representations.
+    pub fn normalize_name(name: &str) -> String {
+        name.nfd().collect::<String>().to_lowercase()
     }
 
     // ==================== UNIFIED WRITE ====================
@@ -382,6 +397,122 @@ impl BaseHandler {
         }
     }
 
+    // ==================== ARROW READ ====================
+
+    /// Execute a query against DuckDB and return results as Arrow RecordBatches.
+    #[cfg(feature = "duckdb")]
+    pub async fn execute_arrow(
+        &self,
+        query: &str,
+        params: &[DuckParam],
+    ) -> Result<Vec<RecordBatch>, DbkitError> {
+        let duck_conn = self
+            .duck_conn
+            .as_ref()
+            .ok_or(DbkitError::DuckDbNotInitialized)?
+            .clone();
+
+        let query = query.to_string();
+        let params = params.to_vec();
+
+        task::spawn_blocking(move || {
+            let conn = duck_conn
+                .lock()
+                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(&query)
+                .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
+
+            let duck_values = Self::convert_params(&params);
+            let param_refs: Vec<&dyn duckdb::ToSql> =
+                duck_values.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+
+            let arrow_iter = stmt
+                .query_arrow(param_refs.as_slice())
+                .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
+
+            Ok(arrow_iter.collect())
+        })
+        .await
+        .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
+    }
+
+    // ==================== SYNC (PG -> DuckDB) ====================
+
+    /// Copy entire tables from Postgres into DuckDB local memory for analytical reads.
+    ///
+    /// Creates `memory.main.{table}` for each table, replacing any existing copy.
+    #[cfg(feature = "duckdb")]
+    pub async fn sync_tables(&self, tables: &[&str]) -> Result<(), DbkitError> {
+        let duck_conn = self
+            .duck_conn
+            .as_ref()
+            .ok_or(DbkitError::DuckDbNotInitialized)?
+            .clone();
+
+        let tables: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
+
+        task::spawn_blocking(move || {
+            let conn = duck_conn
+                .lock()
+                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
+
+            for table in &tables {
+                let sql = format!(
+                    "CREATE OR REPLACE TABLE memory.main.{table} AS SELECT * FROM pg.public.{table}"
+                );
+                conn.execute(&sql, [])
+                    .map_err(|e| DbkitError::DuckDb(format!("sync {table}: {e}")))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
+    }
+
+    /// Copy a filtered subset of a Postgres table into DuckDB local memory.
+    ///
+    /// The `filter` is a SQL WHERE clause (without the `WHERE` keyword).
+    /// Creates `memory.main.{table}`, replacing any existing copy.
+    #[cfg(feature = "duckdb")]
+    pub async fn sync_table_filtered(
+        &self,
+        table: &str,
+        filter: &str,
+        params: &[DuckParam],
+    ) -> Result<(), DbkitError> {
+        let duck_conn = self
+            .duck_conn
+            .as_ref()
+            .ok_or(DbkitError::DuckDbNotInitialized)?
+            .clone();
+
+        let table = table.to_string();
+        let filter = filter.to_string();
+        let params = params.to_vec();
+
+        task::spawn_blocking(move || {
+            let conn = duck_conn
+                .lock()
+                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
+
+            let sql = format!(
+                "CREATE OR REPLACE TABLE memory.main.{table} AS SELECT * FROM pg.public.{table} WHERE {filter}"
+            );
+
+            let duck_values = Self::convert_params(&params);
+            let param_refs: Vec<&dyn duckdb::ToSql> =
+                duck_values.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+
+            conn.execute(&sql, param_refs.as_slice())
+                .map_err(|e| DbkitError::DuckDb(format!("sync_filtered {table}: {e}")))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
+    }
+
     // ==================== PARAM CONVERSION ====================
 
     #[cfg(feature = "duckdb")]
@@ -395,6 +526,26 @@ impl BaseHandler {
                 DuckParam::Text(v) => duckdb::types::Value::Text(v.clone()),
                 DuckParam::Bool(v) => duckdb::types::Value::Boolean(*v),
                 DuckParam::Null => duckdb::types::Value::Null,
+                DuckParam::OptInt(v) => match v {
+                    Some(val) => duckdb::types::Value::Int(*val),
+                    None => duckdb::types::Value::Null,
+                },
+                DuckParam::OptInt64(v) => match v {
+                    Some(val) => duckdb::types::Value::BigInt(*val),
+                    None => duckdb::types::Value::Null,
+                },
+                DuckParam::OptFloat(v) => match v {
+                    Some(val) => duckdb::types::Value::Double(*val),
+                    None => duckdb::types::Value::Null,
+                },
+                DuckParam::OptText(v) => match v {
+                    Some(val) => duckdb::types::Value::Text(val.clone()),
+                    None => duckdb::types::Value::Null,
+                },
+                DuckParam::OptBool(v) => match v {
+                    Some(val) => duckdb::types::Value::Boolean(*val),
+                    None => duckdb::types::Value::Null,
+                },
             })
             .collect()
     }

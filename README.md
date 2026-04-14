@@ -7,8 +7,11 @@ Reusable Postgres + DuckDB database infrastructure for Rust applications.
 - **Connection pooling** — `ConnectionManager` wraps deadpool-postgres with auto-create database, configurable pool size, and timeouts
 - **Configurable** — `DbkitConfig` builder with connection string construction, SSL modes, and pool tuning
 - **Unified query executor** — `BaseHandler` for Postgres writes (`WriteOp`) and optional DuckDB analytical reads (`ReadOp`)
+- **Arrow support** — `execute_arrow()` returns `Vec<RecordBatch>` for ML/analytics pipelines
+- **PG→DuckDB sync** — `sync_tables()` and `sync_table_filtered()` copy Postgres data into local DuckDB for fast analytical reads
 - **Migration tracking** — `InitializationHandler` with named migrations tracked by content hash
 - **Concurrent cache** — Generic DashMap-based key-value cache with named buckets (keys and values default to `String`)
+- **Unicode normalization** — `BaseHandler::normalize_name()` for consistent name matching via NFD decomposition
 - **Optional DuckDB** — behind a `duckdb` feature flag to avoid the heavy bundled build when not needed
 
 ## Usage
@@ -58,8 +61,10 @@ println!("available: {}, waiting: {}", status.available, status.waiting);
 Enable the `duckdb` feature:
 
 ```toml
-dbkit = { version = "0.1", features = ["duckdb"] }
+dbkit = { version = "0.2", features = ["duckdb"] }
 ```
+
+#### Standard mapped reads
 
 ```rust
 use dbkit::{BaseHandler, ReadOp, DuckParam, FetchMode};
@@ -72,6 +77,62 @@ let result = handler.execute_read(ReadOp::Standard {
     map_fn: |row| Ok(row.get::<_, String>(0)?),
     mode: FetchMode::One,
 }).await?;
+```
+
+#### Arrow reads
+
+Returns `Vec<RecordBatch>` directly — ideal for ML training pipelines or columnar analytics:
+
+```rust
+use dbkit::RecordBatch;
+
+let batches = handler.execute_arrow(
+    "SELECT * FROM training_data WHERE label = $1",
+    &[DuckParam::Text("positive".into())],
+).await?;
+```
+
+#### Optional parameters
+
+Use `Opt*` variants when values may be `NULL`:
+
+```rust
+let params = vec![
+    DuckParam::OptInt(Some(42)),
+    DuckParam::OptText(None),        // binds as NULL
+    DuckParam::OptBool(Some(true)),
+];
+```
+
+#### Syncing tables from Postgres to DuckDB
+
+Copy full tables or filtered subsets into DuckDB local memory for fast analytical queries:
+
+```rust
+// Sync entire tables
+handler.sync_tables(&["users", "orders", "products"]).await?;
+
+// Sync with a filter
+handler.sync_table_filtered(
+    "orders",
+    "created_at > $1",
+    &[DuckParam::Text("2024-01-01".into())],
+).await?;
+
+// Now query the local copy (memory.main.orders) for fast reads
+let batches = handler.execute_arrow(
+    "SELECT * FROM memory.main.orders",
+    &[],
+).await?;
+```
+
+### Name normalization
+
+Unicode NFD decomposition + lowercase for consistent name matching:
+
+```rust
+let normalized = BaseHandler::normalize_name("José García");
+assert_eq!(normalized, "jose\u{301} garci\u{301}a");
 ```
 
 ### Cache
@@ -104,7 +165,7 @@ let user = users.get("active", &1).unwrap();
 
 | Feature  | Default | Description |
 |----------|---------|-------------|
-| `duckdb` | off     | Enables DuckDB analytical reads via `BaseHandler::with_duckdb()` |
+| `duckdb` | off     | Enables DuckDB reads, Arrow support, and PG→DuckDB sync via `BaseHandler::with_duckdb()` |
 
 ## License
 
