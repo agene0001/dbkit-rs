@@ -1,0 +1,95 @@
+# dbkit-rs
+
+Reusable Postgres + DuckDB database infrastructure for Rust applications.
+
+## Features
+
+- **Connection pooling** — `ConnectionManager` wraps deadpool-postgres with auto-create database, configurable pool size, and timeouts
+- **Configurable** — `DbkitConfig` builder with connection string construction, SSL modes, and pool tuning
+- **Unified query executor** — `BaseHandler` for Postgres writes (`WriteOp`) and optional DuckDB analytical reads (`ReadOp`)
+- **Migration tracking** — `InitializationHandler` with named migrations tracked by content hash
+- **Concurrent cache** — DashMap-based key-value cache with named buckets
+- **Optional DuckDB** — behind a `duckdb` feature flag to avoid the heavy bundled build when not needed
+
+## Usage
+
+```rust
+use dbkit::{ConnectionManager, DbkitConfig, BaseHandler, InitializationHandler};
+use std::sync::Arc;
+
+// Connect with defaults
+let conn = ConnectionManager::new("postgres://localhost/myapp").await?;
+
+// Or use the config builder
+let config = DbkitConfig::builder()
+    .host("localhost")
+    .database("myapp")
+    .user("admin")
+    .password("secret")
+    .pool_size(32)
+    .build();
+let conn = ConnectionManager::connect(config).await?;
+
+let pool = Arc::new(conn.pool().clone());
+
+// Run tracked migrations
+let init = InitializationHandler::new(pool.clone());
+init.run_named_migration("001_users", "
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL
+    )
+").await?;
+
+// Query
+let handler = BaseHandler::new(pool);
+```
+
+### Pool health
+
+```rust
+let status = conn.pool_status();
+println!("connections: {}/{}", status.size, status.max_size);
+println!("available: {}, waiting: {}", status.available, status.waiting);
+```
+
+### DuckDB reads (optional)
+
+Enable the `duckdb` feature:
+
+```toml
+dbkit = { version = "0.1", features = ["duckdb"] }
+```
+
+```rust
+use dbkit::{BaseHandler, ReadOp, DuckParam, FetchMode};
+
+let handler = BaseHandler::with_duckdb(pool, "postgres://localhost/myapp")?;
+
+let result = handler.execute_read(ReadOp::Standard {
+    query: "SELECT name FROM users WHERE id = $1",
+    params: vec![DuckParam::Int(1)],
+    map_fn: |row| Ok(row.get::<_, String>(0)?),
+    mode: FetchMode::One,
+}).await?;
+```
+
+### Cache
+
+```rust
+use dbkit::Cache;
+
+let cache = Cache::with_buckets(&["products", "prices"]);
+cache.set("products", "abc123", "Widget".to_string());
+let val = cache.get("products", "abc123");
+```
+
+## Feature flags
+
+| Feature  | Default | Description |
+|----------|---------|-------------|
+| `duckdb` | off     | Enables DuckDB analytical reads via `BaseHandler::with_duckdb()` |
+
+## License
+
+MIT

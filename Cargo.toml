@@ -1,0 +1,25 @@
+[package]
+name = "dbkit-rs"
+version = "0.1.1"
+edition = "2021"
+license = "MIT"
+description = "Reusable Postgres + DuckDB database infrastructure: connection pooling, caching, batch operations, and migrations"
+readme = "README.md"
+repository = "https://github.com/agene0001/dbkit-rs"
+homepage = "https://github.com/agene0001/dbkit-rs"
+documentation = "https://docs.rs/dbkit-rs"
+keywords = ["postgres", "duckdb", "database", "connection-pool", "migrations"]
+categories = ["database"]
+
+[features]
+default = []
+duckdb = ["dep:duckdb"]
+
+[dependencies]
+deadpool-postgres = "0.14"
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+duckdb = { version = "1.2", features = ["bundled"], optional = true }
+dashmap = "6"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+thiserror = "2"
