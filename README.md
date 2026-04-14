@@ -8,7 +8,7 @@ Reusable Postgres + DuckDB database infrastructure for Rust applications.
 - **Configurable** — `DbkitConfig` builder with connection string construction, SSL modes, and pool tuning
 - **Unified query executor** — `BaseHandler` for Postgres writes (`WriteOp`) and optional DuckDB analytical reads (`ReadOp`)
 - **Migration tracking** — `InitializationHandler` with named migrations tracked by content hash
-- **Concurrent cache** — DashMap-based key-value cache with named buckets
+- **Concurrent cache** — Generic DashMap-based key-value cache with named buckets (keys and values default to `String`)
 - **Optional DuckDB** — behind a `duckdb` feature flag to avoid the heavy bundled build when not needed
 
 ## Usage
@@ -76,12 +76,28 @@ let result = handler.execute_read(ReadOp::Standard {
 
 ### Cache
 
+Both key and value types are generic, defaulting to `String`:
+
 ```rust
 use dbkit::Cache;
 
-let cache = Cache::with_buckets(&["products", "prices"]);
-cache.set("products", "abc123", "Widget".to_string());
-let val = cache.get("products", "abc123");
+// Default String/String cache — works exactly like before
+let cache: Cache = Cache::with_buckets(&["products", "prices"]);
+cache.set("products", "abc123".into(), "Widget".into());
+let val = cache.get("products", &"abc123".into());
+
+// Typed values: String keys, i32 values
+let counts: Cache<String, i32> = Cache::with_buckets(&["metrics"]);
+counts.set("metrics", "page_views".into(), 42);
+assert_eq!(counts.get("metrics", &"page_views".into()), Some(42));
+
+// Typed keys and values: i32 keys, custom struct values
+#[derive(Clone)]
+struct User { name: String }
+
+let users: Cache<i32, User> = Cache::new();
+users.set("active", 1, User { name: "Alice".into() });
+let user = users.get("active", &1).unwrap();
 ```
 
 ## Feature flags

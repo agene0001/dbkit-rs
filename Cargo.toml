@@ -1,6 +1,6 @@
 [package]
 name = "dbkit-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Reusable Postgres + DuckDB database infrastructure: connection pooling, caching, batch operations, and migrations"
