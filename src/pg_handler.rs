@@ -220,4 +220,22 @@ impl PgHandler {
             .query_arrow(sql, params)
             .await
     }
+
+    /// Like [`execute_read`](Self::execute_read) but deserializes each row into
+    /// `T` via `serde_arrow` — the typed analytical read. `T`'s field names must
+    /// match the query's output column names. Use for DuckDB-side analytical
+    /// reads (large scans / aggregations) that map to typed rows. Errors with
+    /// [`DbkitError::NoReadEngine`] if no engine is attached.
+    #[cfg(feature = "duckdb")]
+    pub async fn execute_read_as<T>(
+        &self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<T>, DbkitError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let batches = self.execute_read(sql, params).await?;
+        crate::analytical::deserialize_batches(&batches)
+    }
 }

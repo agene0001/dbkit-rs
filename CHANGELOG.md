@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2]
+
+### Added
+
+- **`PgHandler::execute_read_as<T>`** — typed analytical read: runs a query on
+  the attached DuckDB engine and deserializes each row into `T` via `serde_arrow`
+  (column names must match `T`'s fields). The typed counterpart to
+  `PgHandler::execute_read`, mirroring `BaseHandler::execute_read_as`, so callers
+  can keep large scans / aggregations on DuckDB without hand-writing Arrow
+  column extraction.
+
 ## [0.3.1]
 
 Additive release (no breaking changes). Adds a native-Postgres, rich-typed
