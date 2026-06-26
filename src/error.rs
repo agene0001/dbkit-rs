@@ -17,8 +17,11 @@ pub enum DbkitError {
     #[error("database '{name}' does not exist and auto-create failed: {reason}")]
     DatabaseCreation { name: String, reason: String },
 
-    #[error("postgres error: {0}")]
-    Postgres(#[from] tokio_postgres::Error),
+    #[error("unsupported database backend: {0}")]
+    UnsupportedBackend(String),
+
+    #[error("database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
 
     #[error("pool error: {0}")]
     Pool(String),
@@ -30,6 +33,19 @@ pub enum DbkitError {
     #[cfg(feature = "duckdb")]
     #[error("DuckDB error: {0}")]
     DuckDb(String),
+
+    #[cfg(feature = "datafusion")]
+    #[error("DataFusion error: {0}")]
+    DataFusion(String),
+
+    #[error("no analytical read engine configured")]
+    NoReadEngine,
+
+    #[error("remote source error: {0}")]
+    Remote(String),
+
+    #[error("type conversion error: {0}")]
+    Conversion(String),
 
     #[error("expected {expected} row(s), got {actual}")]
     RowCount { expected: String, actual: usize },

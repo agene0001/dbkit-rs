@@ -1,30 +1,26 @@
 use crate::DbkitError;
-use deadpool_postgres::Pool;
-#[cfg(feature = "duckdb")]
-use duckdb::Connection as DuckConnection;
-use std::sync::Arc;
-#[cfg(feature = "duckdb")]
-use std::sync::Mutex;
-#[cfg(feature = "duckdb")]
-use tokio::task;
-use tokio_postgres::Row as PgRow;
-use tokio_postgres::types::ToSql;
+use crate::value::DbValue;
+use sqlx::any::{AnyArguments, AnyRow};
+use sqlx::query::Query;
+use sqlx::{Any, AnyPool, AssertSqlSafe};
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
-#[cfg(feature = "duckdb")]
-pub use duckdb::arrow::record_batch::RecordBatch;
+#[cfg(any(feature = "duckdb", feature = "datafusion"))]
+use crate::analytical::RecordBatch;
+#[cfg(any(feature = "duckdb", feature = "datafusion"))]
+use crate::read::ReadEngine;
 
 // ---------------------------------------------------------------------------
-// Write operations (Postgres)
+// Write operations
 // ---------------------------------------------------------------------------
 
-/// Unified write operation types for Postgres.
+/// Unified write operation types.
 pub enum WriteOp<'a> {
     /// Single query with optional return.
     Single {
         query: &'a str,
-        params: &'a [&'a (dyn ToSql + Sync)],
+        params: Vec<DbValue>,
         mode: FetchMode,
     },
     /// Batch of DDL statements executed in a single transaction.
@@ -32,65 +28,8 @@ pub enum WriteOp<'a> {
     /// Same query executed for each parameter set in a transaction.
     BatchParams {
         query: &'a str,
-        params_list: Vec<Vec<Box<dyn ToSql + Sync + Send>>>,
+        params_list: Vec<Vec<DbValue>>,
     },
-}
-
-// ---------------------------------------------------------------------------
-// Read operations (DuckDB)
-// ---------------------------------------------------------------------------
-
-/// Unified read operation types for DuckDB.
-#[cfg(feature = "duckdb")]
-pub enum ReadOp<'a, T, F>
-where
-    F: Fn(&duckdb::Row<'_>) -> Result<T, DbkitError> + Send + 'static,
-    T: Send + 'static,
-{
-    /// Standard mapped query.
-    Standard {
-        query: &'a str,
-        params: Vec<DuckParam>,
-        map_fn: F,
-        mode: FetchMode,
-    },
-    /// Arrow columnar query — returns `Vec<RecordBatch>`.
-    Arrow {
-        query: &'a str,
-        params: Vec<DuckParam>,
-    },
-}
-
-#[cfg(feature = "duckdb")]
-type NoopMapFn = fn(&duckdb::Row<'_>) -> Result<(), DbkitError>;
-
-#[cfg(feature = "duckdb")]
-impl<'a> ReadOp<'a, (), NoopMapFn> {
-    /// Convenience constructor for Arrow reads without needing type annotations.
-    ///
-    /// ```ignore
-    /// handler.execute_read(ReadOp::arrow("SELECT * FROM t", vec![])).await?.arrow()?
-    /// ```
-    pub fn arrow(query: &'a str, params: Vec<DuckParam>) -> Self {
-        ReadOp::Arrow { query, params }
-    }
-}
-
-/// DuckDB parameter types (including optional variants).
-#[cfg(feature = "duckdb")]
-#[derive(Debug, Clone)]
-pub enum DuckParam {
-    Int(i32),
-    Int64(i64),
-    Float(f64),
-    Text(String),
-    Bool(bool),
-    Null,
-    OptInt(Option<i32>),
-    OptInt64(Option<i64>),
-    OptFloat(Option<f64>),
-    OptText(Option<String>),
-    OptBool(Option<bool>),
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +45,7 @@ pub enum FetchMode {
     All,
 }
 
-/// Result wrapper for Postgres write queries.
+/// Result wrapper for write queries.
 pub enum QueryResult<T> {
     None,
     One(T),
@@ -148,105 +87,107 @@ impl<T> QueryResult<T> {
     }
 }
 
-/// Result wrapper for DuckDB read queries.
-#[cfg(feature = "duckdb")]
-pub enum ReadResult<T> {
-    Standard(QueryResult<T>),
-    Arrow(Vec<RecordBatch>),
-}
+// ---------------------------------------------------------------------------
+// Parameter binding
+// ---------------------------------------------------------------------------
 
-#[cfg(feature = "duckdb")]
-impl<T> ReadResult<T> {
-    pub fn standard(self) -> Result<QueryResult<T>, DbkitError> {
-        match self {
-            Self::Standard(qr) => Ok(qr),
-            _ => Err(DbkitError::RowCount {
-                expected: "Standard".into(),
-                actual: 0,
-            }),
-        }
+/// Bind a slice of [`DbValue`]s onto a sqlx query, in order.
+///
+/// Values are bound by owned copy, so the returned query does not borrow
+/// `params`.
+fn bind_params<'q>(
+    mut q: Query<'q, Any, AnyArguments>,
+    params: &[DbValue],
+) -> Query<'q, Any, AnyArguments> {
+    for p in params {
+        q = match p {
+            DbValue::Null => q.bind(Option::<i64>::None),
+            DbValue::Bool(b) => q.bind(*b),
+            DbValue::Int(i) => q.bind(*i),
+            DbValue::Float(f) => q.bind(*f),
+            DbValue::Text(s) => q.bind(s.clone()),
+            DbValue::Bytes(b) => q.bind(b.clone()),
+        };
     }
-
-    pub fn arrow(self) -> Result<Vec<RecordBatch>, DbkitError> {
-        match self {
-            Self::Arrow(batches) => Ok(batches),
-            _ => Err(DbkitError::RowCount {
-                expected: "Arrow".into(),
-                actual: 0,
-            }),
-        }
-    }
+    q
 }
 
 // ---------------------------------------------------------------------------
 // BaseHandler
 // ---------------------------------------------------------------------------
 
-/// Core query executor for Postgres writes and optionally DuckDB reads.
+/// Core query executor: transactional writes via sqlx, and optionally
+/// analytical reads via a pluggable [`ReadEngine`] (DuckDB or DataFusion).
 pub struct BaseHandler {
-    pg_pool: Arc<Pool>,
-    #[cfg(feature = "duckdb")]
-    duck_conn: Option<Arc<Mutex<DuckConnection>>>,
+    pool: AnyPool,
+    #[cfg(any(feature = "duckdb", feature = "datafusion"))]
+    read_engine: Option<Box<dyn ReadEngine>>,
 }
 
 impl BaseHandler {
-    /// Create a handler with Postgres only (for writes).
-    pub fn new(pg_pool: Arc<Pool>) -> Self {
+    /// Create a handler for writes against the given sqlx pool.
+    pub fn new(pool: AnyPool) -> Self {
         Self {
-            pg_pool,
-            #[cfg(feature = "duckdb")]
-            duck_conn: None,
+            pool,
+            #[cfg(any(feature = "duckdb", feature = "datafusion"))]
+            read_engine: None,
         }
     }
 
-    /// Create a handler with Postgres + DuckDB attached (for reads + writes).
+    /// Create a handler with an in-memory DuckDB analytical read engine.
     #[cfg(feature = "duckdb")]
-    pub fn with_duckdb(
-        pg_pool: Arc<Pool>,
-        pg_connection_string: &str,
-    ) -> Result<Self, DbkitError> {
-        let duck_conn = DuckConnection::open_in_memory()
-            .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-        duck_conn
-            .execute_batch("INSTALL postgres; LOAD postgres;")
-            .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-        duck_conn
-            .execute(
-                &format!(
-                    "ATTACH '{}' AS pg (TYPE POSTGRES)",
-                    pg_connection_string
-                ),
-                [],
-            )
-            .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-        duck_conn
-            .execute("USE pg", [])
-            .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
+    pub fn with_duckdb(pool: AnyPool) -> Result<Self, DbkitError> {
+        let engine = crate::read::duckdb::DuckEngine::new_in_memory()?;
         Ok(Self {
-            pg_pool,
-            duck_conn: Some(Arc::new(Mutex::new(duck_conn))),
+            pool,
+            read_engine: Some(Box::new(engine)),
         })
     }
 
-    /// Whether DuckDB is attached for reads.
-    pub fn has_duckdb(&self) -> bool {
-        #[cfg(feature = "duckdb")]
+    /// Create a handler with DuckDB and a live Postgres attachment.
+    ///
+    /// DuckDB queries the Postgres tables directly via the `pg` catalog
+    /// (`SELECT … FROM pg.<schema>.<table>`) without an explicit sync — the
+    /// pre-rewrite zero-copy `ATTACH` pipeline. You can still also `sync_*`
+    /// tables into local memory for faster repeated analytics.
+    #[cfg(feature = "duckdb")]
+    pub fn with_duckdb_attached_postgres(
+        pool: AnyPool,
+        pg_connection_string: &str,
+    ) -> Result<Self, DbkitError> {
+        let engine = crate::read::duckdb::DuckEngine::new_in_memory()?;
+        engine.attach_postgres(pg_connection_string)?;
+        Ok(Self {
+            pool,
+            read_engine: Some(Box::new(engine)),
+        })
+    }
+
+    /// Create a handler with a DataFusion analytical read engine.
+    #[cfg(feature = "datafusion")]
+    pub fn with_datafusion(pool: AnyPool) -> Result<Self, DbkitError> {
+        let engine = crate::read::datafusion::DataFusionEngine::new();
+        Ok(Self {
+            pool,
+            read_engine: Some(Box::new(engine)),
+        })
+    }
+
+    /// Whether an analytical read engine is attached.
+    pub fn has_read_engine(&self) -> bool {
+        #[cfg(any(feature = "duckdb", feature = "datafusion"))]
         {
-            self.duck_conn.is_some()
+            self.read_engine.is_some()
         }
-        #[cfg(not(feature = "duckdb"))]
+        #[cfg(not(any(feature = "duckdb", feature = "datafusion")))]
         {
             false
         }
     }
 
-    /// Get a reference to the Postgres pool.
-    pub fn pool(&self) -> &Arc<Pool> {
-        &self.pg_pool
+    /// Get a reference to the write pool.
+    pub fn pool(&self) -> &AnyPool {
+        &self.pool
     }
 
     /// Unicode NFD normalization — decomposes characters then lowercases.
@@ -257,49 +198,48 @@ impl BaseHandler {
 
     // ==================== UNIFIED WRITE ====================
 
-    /// Execute a write operation against Postgres.
+    /// Execute a write operation against the transactional pool.
+    ///
+    /// Placeholders are backend-native: `$1, $2, …` for Postgres, `?` for
+    /// MySQL/SQLite. sqlx's `Any` driver does not rewrite them, so write the
+    /// SQL for the backend you connected to.
     pub async fn execute_write(
         &self,
         op: WriteOp<'_>,
-    ) -> Result<QueryResult<PgRow>, DbkitError> {
-        let mut client = self
-            .pg_pool
-            .get()
-            .await
-            .map_err(|e| DbkitError::Pool(e.to_string()))?;
-
+    ) -> Result<QueryResult<AnyRow>, DbkitError> {
         match op {
             WriteOp::Single {
                 query,
                 params,
                 mode,
-            } => match mode {
-                FetchMode::None => {
-                    client.execute(query, params).await?;
-                    Ok(QueryResult::None)
+            } => {
+                let q = bind_params(sqlx::query(AssertSqlSafe(query)), &params);
+                match mode {
+                    FetchMode::None => {
+                        q.execute(&self.pool).await?;
+                        Ok(QueryResult::None)
+                    }
+                    FetchMode::One => {
+                        let row = q.fetch_one(&self.pool).await?;
+                        Ok(QueryResult::One(row))
+                    }
+                    FetchMode::Optional => {
+                        let row = q.fetch_optional(&self.pool).await?;
+                        Ok(QueryResult::Optional(row))
+                    }
+                    FetchMode::All => {
+                        let rows = q.fetch_all(&self.pool).await?;
+                        Ok(QueryResult::All(rows))
+                    }
                 }
-                FetchMode::One => {
-                    let row = client.query_one(query, params).await?;
-                    Ok(QueryResult::One(row))
-                }
-                FetchMode::Optional => {
-                    let row = client.query_opt(query, params).await?;
-                    Ok(QueryResult::Optional(row))
-                }
-                FetchMode::All => {
-                    let rows = client.query(query, params).await?;
-                    Ok(QueryResult::All(rows))
-                }
-            },
+            }
 
             WriteOp::BatchDDL { queries } => {
-                let transaction = client.transaction().await?;
-
+                let mut tx = self.pool.begin().await?;
                 for query in queries {
-                    transaction.execute(*query, &[]).await?;
+                    sqlx::query(AssertSqlSafe(*query)).execute(&mut *tx).await?;
                 }
-
-                transaction.commit().await?;
+                tx.commit().await?;
                 Ok(QueryResult::None)
             }
 
@@ -312,25 +252,20 @@ impl BaseHandler {
                 }
 
                 let total = params_list.len();
-                let transaction = client.transaction().await?;
-                let stmt = transaction.prepare(query).await?;
+                let mut tx = self.pool.begin().await?;
                 let mut failed = 0usize;
 
-                let max_params = params_list.first().map(|p| p.len()).unwrap_or(0);
-                let mut params_refs: Vec<&(dyn ToSql + Sync)> =
-                    Vec::with_capacity(max_params);
-
                 for (idx, params) in params_list.iter().enumerate() {
-                    params_refs.clear();
-                    params_refs
-                        .extend(params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)));
-                    if let Err(e) = transaction.execute(&stmt, &params_refs[..]).await {
+                    // sqlx caches the prepared statement per query string on the
+                    // connection, so re-issuing the same query reuses it.
+                    let q = bind_params(sqlx::query(AssertSqlSafe(query)), params);
+                    if let Err(e) = q.execute(&mut *tx).await {
                         warn!("BatchParams row {}/{} failed: {:?}", idx + 1, total, e);
                         failed += 1;
                     }
                 }
 
-                transaction.commit().await?;
+                tx.commit().await?;
 
                 if failed > 0 {
                     warn!(
@@ -348,228 +283,82 @@ impl BaseHandler {
 
     // ==================== UNIFIED READ ====================
 
-    /// Execute a read operation against DuckDB.
-    #[cfg(feature = "duckdb")]
-    pub async fn execute_read<T, F>(
+    /// Execute an analytical query against the attached read engine, returning
+    /// columnar Arrow [`RecordBatch`]es.
+    ///
+    /// Returns [`DbkitError::NoReadEngine`] if no engine is attached.
+    #[cfg(any(feature = "duckdb", feature = "datafusion"))]
+    pub async fn execute_read(
         &self,
-        op: ReadOp<'_, T, F>,
-    ) -> Result<ReadResult<T>, DbkitError>
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<RecordBatch>, DbkitError> {
+        self.read_engine
+            .as_ref()
+            .ok_or(DbkitError::NoReadEngine)?
+            .query_arrow(sql, params)
+            .await
+    }
+
+    /// Execute an analytical query and deserialize each row into `T`.
+    ///
+    /// This is the typed-read replacement for the old closure-mapped
+    /// `ReadOp::Standard`: instead of a `|row| …` closure, derive
+    /// `serde::Deserialize` on your row struct. Works for any read engine,
+    /// since it deserializes from the Arrow batches via `serde_arrow`.
+    ///
+    /// ```ignore
+    /// #[derive(serde::Deserialize)]
+    /// struct Item { name: String, qty: i64 }
+    /// let items: Vec<Item> = handler.execute_read_as("SELECT name, qty FROM items", &[]).await?;
+    /// ```
+    #[cfg(any(feature = "duckdb", feature = "datafusion"))]
+    pub async fn execute_read_as<T>(
+        &self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<T>, DbkitError>
     where
-        F: Fn(&duckdb::Row<'_>) -> Result<T, DbkitError> + Send + 'static,
-        T: Send + 'static,
+        T: serde::de::DeserializeOwned,
     {
-        let duck_conn = self
-            .duck_conn
-            .as_ref()
-            .ok_or(DbkitError::DuckDbNotInitialized)?
-            .clone();
-
-        match op {
-            ReadOp::Standard {
-                query,
-                params,
-                map_fn,
-                mode,
-            } => {
-                let query = query.to_string();
-                let params = params.clone();
-
-                let results = task::spawn_blocking(move || {
-                    let conn = duck_conn
-                        .lock()
-                        .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
-                    let mut stmt = conn
-                        .prepare(&query)
-                        .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-                    let duck_values = Self::convert_params(&params);
-                    let param_refs: Vec<&dyn duckdb::ToSql> =
-                        duck_values.iter().map(|v| v as &dyn duckdb::ToSql).collect();
-
-                    let rows = stmt
-                        .query_map(param_refs.as_slice(), |row| {
-                            map_fn(row).map_err(|e| {
-                                duckdb::Error::InvalidParameterName(e.to_string())
-                            })
-                        })
-                        .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-                    let mut results = Vec::new();
-                    for row in rows {
-                        results
-                            .push(row.map_err(|e| DbkitError::DuckDb(e.to_string()))?);
-                    }
-                    Ok::<Vec<T>, DbkitError>(results)
-                })
-                .await
-                .map_err(|e| DbkitError::TaskJoin(e.to_string()))??;
-
-                let query_result = match mode {
-                    FetchMode::None => QueryResult::None,
-                    FetchMode::One => {
-                        if results.len() != 1 {
-                            return Err(DbkitError::RowCount {
-                                expected: "1".into(),
-                                actual: results.len(),
-                            });
-                        }
-                        QueryResult::One(results.into_iter().next().unwrap())
-                    }
-                    FetchMode::Optional => {
-                        if results.len() > 1 {
-                            return Err(DbkitError::RowCount {
-                                expected: "0 or 1".into(),
-                                actual: results.len(),
-                            });
-                        }
-                        QueryResult::Optional(results.into_iter().next())
-                    }
-                    FetchMode::All => QueryResult::All(results),
-                };
-
-                Ok(ReadResult::Standard(query_result))
-            }
-
-            ReadOp::Arrow { query, params } => {
-                let query = query.to_string();
-                let params = params.clone();
-
-                let batches = task::spawn_blocking(move || {
-                    let conn = duck_conn
-                        .lock()
-                        .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
-                    let mut stmt = conn
-                        .prepare(&query)
-                        .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-                    let duck_values = Self::convert_params(&params);
-                    let param_refs: Vec<&dyn duckdb::ToSql> =
-                        duck_values.iter().map(|v| v as &dyn duckdb::ToSql).collect();
-
-                    let arrow_iter = stmt
-                        .query_arrow(param_refs.as_slice())
-                        .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-                    Ok::<Vec<RecordBatch>, DbkitError>(arrow_iter.collect())
-                })
-                .await
-                .map_err(|e| DbkitError::TaskJoin(e.to_string()))??;
-
-                Ok(ReadResult::Arrow(batches))
-            }
-        }
+        let batches = self.execute_read(sql, params).await?;
+        crate::analytical::deserialize_batches(&batches)
     }
 
-    // ==================== SYNC (PG -> DuckDB) ====================
+    // ==================== SYNC (transactional -> analytical) ====================
 
-    /// Copy entire tables from Postgres into DuckDB local memory for analytical reads.
+    /// Run a query against the transactional pool and load its result into the
+    /// analytical engine as a named in-memory table.
     ///
-    /// Creates `memory.main.{table}` for each table, replacing any existing copy.
-    #[cfg(feature = "duckdb")]
-    pub async fn sync_tables(&self, tables: &[&str]) -> Result<(), DbkitError> {
-        let duck_conn = self
-            .duck_conn
-            .as_ref()
-            .ok_or(DbkitError::DuckDbNotInitialized)?
-            .clone();
-
-        let tables: Vec<String> = tables.iter().map(|t| t.to_string()).collect();
-
-        task::spawn_blocking(move || {
-            let conn = duck_conn
-                .lock()
-                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
-
-            for table in &tables {
-                let sql = format!(
-                    "CREATE OR REPLACE TABLE memory.main.{table} AS SELECT * FROM pg.public.{table}"
-                );
-                conn.execute(&sql, [])
-                    .map_err(|e| DbkitError::DuckDb(format!("sync {table}: {e}")))?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
-    }
-
-    /// Copy a filtered subset of a Postgres table into DuckDB local memory.
-    ///
-    /// The `filter` is a SQL WHERE clause (without the `WHERE` keyword).
-    /// Creates `memory.main.{table}`, replacing any existing copy.
-    #[cfg(feature = "duckdb")]
-    pub async fn sync_table_filtered(
+    /// This is the engine-agnostic replacement for the old DuckDB `ATTACH`
+    /// sync: rows are fetched over sqlx, converted to Arrow, and handed to the
+    /// active read engine. Works for any backend × engine combination.
+    #[cfg(any(feature = "duckdb", feature = "datafusion"))]
+    pub async fn sync_query(
         &self,
-        table: &str,
-        filter: &str,
-        params: &[DuckParam],
+        name: &str,
+        query: &str,
+        params: &[DbValue],
     ) -> Result<(), DbkitError> {
-        let duck_conn = self
-            .duck_conn
-            .as_ref()
-            .ok_or(DbkitError::DuckDbNotInitialized)?
-            .clone();
+        let engine = self.read_engine.as_ref().ok_or(DbkitError::NoReadEngine)?;
 
-        let table = table.to_string();
-        let filter = filter.to_string();
-        let params = params.to_vec();
+        let q = bind_params(sqlx::query(AssertSqlSafe(query.to_string())), params);
+        let rows = q.fetch_all(&self.pool).await?;
 
-        task::spawn_blocking(move || {
-            let conn = duck_conn
-                .lock()
-                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
-
-            let sql = format!(
-                "CREATE OR REPLACE TABLE memory.main.{table} AS SELECT * FROM pg.public.{table} WHERE {filter}"
-            );
-
-            let duck_values = Self::convert_params(&params);
-            let param_refs: Vec<&dyn duckdb::ToSql> =
-                duck_values.iter().map(|v| v as &dyn duckdb::ToSql).collect();
-
-            conn.execute(&sql, param_refs.as_slice())
-                .map_err(|e| DbkitError::DuckDb(format!("sync_filtered {table}: {e}")))?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
+        if let Some(batch) = crate::read::rows_to_record_batch(&rows)? {
+            engine.load_table(name, vec![batch]).await?;
+        }
+        Ok(())
     }
 
-    // ==================== PARAM CONVERSION ====================
-
-    #[cfg(feature = "duckdb")]
-    fn convert_params(params: &[DuckParam]) -> Vec<duckdb::types::Value> {
-        params
-            .iter()
-            .map(|p| match p {
-                DuckParam::Int(v) => duckdb::types::Value::Int(*v),
-                DuckParam::Int64(v) => duckdb::types::Value::BigInt(*v),
-                DuckParam::Float(v) => duckdb::types::Value::Double(*v),
-                DuckParam::Text(v) => duckdb::types::Value::Text(v.clone()),
-                DuckParam::Bool(v) => duckdb::types::Value::Boolean(*v),
-                DuckParam::Null => duckdb::types::Value::Null,
-                DuckParam::OptInt(v) => match v {
-                    Some(val) => duckdb::types::Value::Int(*val),
-                    None => duckdb::types::Value::Null,
-                },
-                DuckParam::OptInt64(v) => match v {
-                    Some(val) => duckdb::types::Value::BigInt(*val),
-                    None => duckdb::types::Value::Null,
-                },
-                DuckParam::OptFloat(v) => match v {
-                    Some(val) => duckdb::types::Value::Double(*val),
-                    None => duckdb::types::Value::Null,
-                },
-                DuckParam::OptText(v) => match v {
-                    Some(val) => duckdb::types::Value::Text(val.clone()),
-                    None => duckdb::types::Value::Null,
-                },
-                DuckParam::OptBool(v) => match v {
-                    Some(val) => duckdb::types::Value::Boolean(*val),
-                    None => duckdb::types::Value::Null,
-                },
-            })
-            .collect()
+    /// Copy entire tables from the transactional store into the analytical
+    /// engine, one table per name (`SELECT * FROM {table}`).
+    #[cfg(any(feature = "duckdb", feature = "datafusion"))]
+    pub async fn sync_tables(&self, tables: &[&str]) -> Result<(), DbkitError> {
+        for table in tables {
+            self.sync_query(table, &format!("SELECT * FROM {table}"), &[])
+                .await?;
+        }
+        Ok(())
     }
 }
