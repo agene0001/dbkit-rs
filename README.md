@@ -82,7 +82,7 @@ Enable a read engine. DuckDB and DataFusion share the Arrow `RecordBatch`
 contract, so either can be used the same way:
 
 ```toml
-dbkit = { version = "0.2", features = ["duckdb"] }       # or "datafusion"
+dbkit = { version = "0.3", features = ["duckdb"] }       # or "datafusion"
 ```
 
 Attach a read engine to the handler:
@@ -143,7 +143,7 @@ decimal), enable `postgres-native` and drop to a real `PgPool` with full sqlx
 type support:
 
 ```toml
-dbkit = { version = "0.2", features = ["postgres-native"] }
+dbkit = { version = "0.3", features = ["postgres-native"] }
 ```
 
 ```rust
