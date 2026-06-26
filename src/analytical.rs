@@ -30,9 +30,9 @@ where
 
 /// Serialize typed rows into a single Arrow [`RecordBatch`] via `serde_arrow`.
 ///
-/// The Arrow schema is inferred from the row samples. Shared by remote
-/// `write_rows`.
-#[cfg(feature = "_read-typed")]
+/// The Arrow schema is inferred from the row samples. Used by remote sink
+/// `write_rows` (currently only ClickHouse).
+#[cfg(feature = "clickhouse")]
 pub(crate) fn serialize_rows<T>(rows: &[T]) -> Result<RecordBatch, crate::DbkitError>
 where
     T: serde::Serialize,

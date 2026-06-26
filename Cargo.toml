@@ -10,6 +10,7 @@ homepage = "https://github.com/agene0001/dbkit-rs"
 documentation = "https://docs.rs/dbkit-rs"
 keywords = ["database", "sqlx", "duckdb", "datafusion", "arrow"]
 categories = ["database"]
+exclude = [".claude/"]
 
 [lib]
 name = "dbkit"
@@ -48,7 +49,7 @@ serde_arrow = { version = "0.14", optional = true }
 # Single direct arrow dependency — unifies with the engines' arrow (all on 58).
 arrow = { version = "58", optional = true }
 # HTTP client for remote sources (ClickHouse), rustls to avoid native-tls.
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "query"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
