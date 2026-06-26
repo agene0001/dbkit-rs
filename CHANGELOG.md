@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1]
+
+Additive release (no breaking changes). Adds a native-Postgres, rich-typed
+handler combining an OLTP read/write path (sqlx `PgPool`) with the analytical
+Arrow read path (DuckDB), so applications with pervasive Postgres-specific types
+can adopt 0.3 without rewriting their reads into typed structs.
+
+### Added
+
+- **`PgHandler`** (`postgres-native` feature) — a rich-typed counterpart to
+  `BaseHandler` backed by a native `sqlx::PgPool`. Binds date/timestamp/json/
+  uuid/time/array `DbValue`s to their native Postgres types (no text fallback)
+  and returns `PgRow`s. `new` / `with_duckdb` / `with_duckdb_attached_postgres`
+  constructors.
+- **`PgHandler::query`** — the OLTP read path: runs a query against the native
+  Postgres pool and returns `QueryResult<PgRow>` per `FetchMode` (single
+  round-trip, no analytical engine). Read columns with `row.get(i)` /
+  `row.try_get(i)`. `execute_write`'s `Single` now delegates to it.
+- **`PgHandler::execute_read`** — the analytical path: runs a query against the
+  attached DuckDB engine and returns Arrow `RecordBatch`es (for large
+  joins/aggregations consumed as DataFrames). Pairs with `BaseHandler`'s
+  `execute_read_as` for typed deserialization.
+- **Rich `DbValue` variants** (`postgres-native`): `Date`, `DateTime`,
+  `TimestampTz`, `Json`, `Uuid`, `Time`, `TextArray`, `FloatArray`,
+  `OptFloatArray`, each with a `From` conversion. Native binds via `PgHandler`;
+  on the `Any` write path and DuckDB read path they fall back to a text / array-
+  literal rendering (enough for filters and Postgres assignment casts).
+
 ## [0.3.0]
 
 A major rewrite turning dbkit from a Postgres-+-DuckDB library into a

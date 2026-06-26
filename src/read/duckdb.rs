@@ -54,6 +54,7 @@ impl DuckEngine {
         .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
         Ok(())
     }
+
 }
 
 #[async_trait]
@@ -138,6 +139,30 @@ fn convert_params(params: &[DbValue]) -> Vec<::duckdb::types::Value> {
             DbValue::Float(f) => Value::Double(*f),
             DbValue::Text(s) => Value::Text(s.clone()),
             DbValue::Bytes(b) => Value::Blob(b.clone()),
+            // Rich types are passed as text; DuckDB casts them against the
+            // target column (incl. ATTACHed Postgres date/json columns).
+            #[cfg(feature = "postgres-native")]
+            DbValue::Date(d) => Value::Text(d.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::DateTime(dt) => Value::Text(dt.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::TimestampTz(dt) => Value::Text(dt.to_rfc3339()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::Json(j) => Value::Text(j.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::Uuid(u) => Value::Text(u.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::Time(t) => Value::Text(t.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::TextArray(v) => Value::Text(crate::value::pg_text_array_literal(v)),
+            #[cfg(feature = "postgres-native")]
+            DbValue::FloatArray(v) => {
+                Value::Text(crate::value::pg_float_array_literal(v.iter().map(|x| Some(*x))))
+            }
+            #[cfg(feature = "postgres-native")]
+            DbValue::OptFloatArray(v) => {
+                Value::Text(crate::value::pg_float_array_literal(v.iter().copied()))
+            }
         })
         .collect()
 }

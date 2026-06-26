@@ -43,3 +43,4 @@ pub trait ReadEngine: Send + Sync {
         batches: Vec<RecordBatch>,
     ) -> Result<(), DbkitError>;
 }
+

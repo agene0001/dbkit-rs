@@ -38,6 +38,8 @@ pub mod config;
 mod connection;
 mod error;
 mod initialization;
+#[cfg(feature = "postgres-native")]
+mod pg_handler;
 #[cfg(any(feature = "duckdb", feature = "datafusion"))]
 mod read;
 #[cfg(feature = "clickhouse")]
@@ -72,5 +74,11 @@ pub use remote::{
 pub use sqlx::{AnyPool, any::AnyRow};
 
 // Native Postgres pool (rich types) — see `ConnectionManager::pg_native_pool`.
+// `PgHandler` is the rich-typed counterpart to `BaseHandler` (binds
+// date/timestamp/json/uuid `DbValue`s natively and returns `PgRow`).
 #[cfg(feature = "postgres-native")]
-pub use sqlx::PgPool;
+pub use pg_handler::PgHandler;
+// `Row` is the trait that provides `PgRow::get` / `try_get`; callers need it in
+// scope to read columns off the `PgRow`s returned by `PgHandler::query`.
+#[cfg(feature = "postgres-native")]
+pub use sqlx::{PgPool, Row, postgres::PgRow};

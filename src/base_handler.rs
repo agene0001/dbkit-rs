@@ -107,6 +107,31 @@ fn bind_params<'q>(
             DbValue::Float(f) => q.bind(*f),
             DbValue::Text(s) => q.bind(s.clone()),
             DbValue::Bytes(b) => q.bind(b.clone()),
+            // The Any driver can't carry native temporal/json/uuid types, so
+            // bind a text rendering — Postgres assignment casts handle the rest.
+            // For native rich-typed binds use `PgHandler` instead.
+            #[cfg(feature = "postgres-native")]
+            DbValue::Date(d) => q.bind(d.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::DateTime(dt) => q.bind(dt.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::TimestampTz(dt) => q.bind(dt.to_rfc3339()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::Json(j) => q.bind(j.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::Uuid(u) => q.bind(u.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::Time(t) => q.bind(t.to_string()),
+            #[cfg(feature = "postgres-native")]
+            DbValue::TextArray(v) => q.bind(crate::value::pg_text_array_literal(v)),
+            #[cfg(feature = "postgres-native")]
+            DbValue::FloatArray(v) => {
+                q.bind(crate::value::pg_float_array_literal(v.iter().map(|x| Some(*x))))
+            }
+            #[cfg(feature = "postgres-native")]
+            DbValue::OptFloatArray(v) => {
+                q.bind(crate::value::pg_float_array_literal(v.iter().copied()))
+            }
         };
     }
     q
