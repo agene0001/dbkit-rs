@@ -38,6 +38,8 @@ pub mod config;
 mod connection;
 mod error;
 mod initialization;
+#[cfg(feature = "postgres-native")]
+mod pg_handler;
 #[cfg(any(feature = "duckdb", feature = "datafusion"))]
 mod read;
 #[cfg(feature = "clickhouse")]
@@ -62,6 +64,10 @@ pub use analytical::{RecordBatch, arrow};
 #[cfg(any(feature = "duckdb", feature = "datafusion"))]
 pub use read::ReadEngine;
 
+// Row-mapped read API (DuckDB) used by `PgHandler::execute_read`.
+#[cfg(feature = "duckdb")]
+pub use read::{ReadOp, ReadResult};
+
 // Remote analytical sources (read) and sinks (bulk write).
 #[cfg(feature = "clickhouse")]
 pub use remote::{
@@ -72,5 +78,9 @@ pub use remote::{
 pub use sqlx::{AnyPool, any::AnyRow};
 
 // Native Postgres pool (rich types) — see `ConnectionManager::pg_native_pool`.
+// `PgHandler` is the rich-typed counterpart to `BaseHandler` (binds
+// date/timestamp/json/uuid `DbValue`s natively and returns `PgRow`).
 #[cfg(feature = "postgres-native")]
-pub use sqlx::PgPool;
+pub use pg_handler::PgHandler;
+#[cfg(feature = "postgres-native")]
+pub use sqlx::{PgPool, postgres::PgRow};

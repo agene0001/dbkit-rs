@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1]
+
+Additive release (no breaking changes). Restores a native-Postgres,
+rich-typed handler and the ergonomic row-mapped read API from 0.2.x, so
+applications with pervasive Postgres-specific types and closure-mapped reads can
+adopt 0.3 by aliasing rather than rewriting.
+
+### Added
+
+- **`PgHandler`** (`postgres-native` feature) — a rich-typed counterpart to
+  `BaseHandler` backed by a native `sqlx::PgPool`. Binds date/timestamp/json/
+  uuid/time/array `DbValue`s to their native Postgres types (no text fallback)
+  and returns `PgRow`s. `new` / `with_duckdb` / `with_duckdb_attached_postgres`
+  constructors; `execute_write` (sqlx) and `execute_read` (DuckDB, row-mapped).
+- **Row-mapped read API** — `ReadOp::Standard { query, params, map_fn, mode }`
+  (closure over a native `duckdb::Row`) and `ReadOp::Arrow`, returning
+  `ReadResult` (`.standard()` / `.arrow()`). Driven by `PgHandler::execute_read`.
+  Restores the 0.2.x ergonomics alongside the Arrow-only `execute_read`.
+- **Rich `DbValue` variants** (`postgres-native`): `Date`, `DateTime`,
+  `TimestampTz`, `Json`, `Uuid`, `Time`, `TextArray`, `FloatArray`,
+  `OptFloatArray`, each with a `From` conversion. Native binds via `PgHandler`;
+  on the `Any` write path and DuckDB read path they fall back to a text / array-
+  literal rendering (enough for filters and Postgres assignment casts).
+
 ## [0.3.0]
 
 A major rewrite turning dbkit from a Postgres-+-DuckDB library into a
