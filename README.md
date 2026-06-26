@@ -1,26 +1,31 @@
 # dbkit-rs
 
-Reusable Postgres + DuckDB database infrastructure for Rust applications.
+Multi-backend database infrastructure for Rust applications.
+
+Transactional writes go through [sqlx]'s `Any` driver — the backend (Postgres,
+MySQL, or SQLite) is chosen by the connection URL scheme. Analytical reads go
+through a pluggable, Arrow-based engine (DuckDB or DataFusion) behind feature
+flags.
 
 ## Features
 
-- **Connection pooling** — `ConnectionManager` wraps deadpool-postgres with auto-create database, configurable pool size, and timeouts
-- **Configurable** — `DbkitConfig` builder with connection string construction, SSL modes, and pool tuning
-- **Unified query executor** — `BaseHandler` for Postgres writes (`WriteOp`) and optional DuckDB analytical reads (`ReadOp`)
-- **Arrow support** — `execute_arrow()` returns `Vec<RecordBatch>` for ML/analytics pipelines
-- **PG→DuckDB sync** — `sync_tables()` and `sync_table_filtered()` copy Postgres data into local DuckDB for fast analytical reads
-- **Migration tracking** — `InitializationHandler` with named migrations tracked by content hash
-- **Concurrent cache** — Generic DashMap-based key-value cache with named buckets (keys and values default to `String`)
+- **Multi-backend writes** — `ConnectionManager` + `BaseHandler` over sqlx; `postgres://`, `mysql://`, or `sqlite://` selects the backend
+- **Connection pooling** — auto-create database, configurable pool size and timeouts
+- **Configurable** — `DbkitConfig` builder with URL construction, SSL modes, and pool tuning
+- **Unified writes** — `execute_write` with `WriteOp` (single / batch DDL / batch params) and neutral `DbValue` parameters
+- **Analytical reads** — `execute_read` returns `Vec<RecordBatch>` (Arrow); `execute_read_as::<T>` deserializes rows into typed structs via `serde_arrow`
+- **Pluggable read engines** — DuckDB or DataFusion (both may be enabled together; they share an Arrow version)
+- **Transactional → analytical sync** — `sync_tables()` / `sync_query()` copy data into the read engine (any backend × any engine); DuckDB can also attach Postgres live
+- **Backend-aware migrations** — `InitializationHandler` with named migrations tracked by content hash, portable across Postgres/MySQL/SQLite
+- **Concurrent cache** — generic DashMap-based key-value cache with named buckets
 - **Unicode normalization** — `BaseHandler::normalize_name()` for consistent name matching via NFD decomposition
-- **Optional DuckDB** — behind a `duckdb` feature flag to avoid the heavy bundled build when not needed
 
 ## Usage
 
 ```rust
-use dbkit::{ConnectionManager, DbkitConfig, BaseHandler, InitializationHandler};
-use std::sync::Arc;
+use dbkit::{BaseHandler, ConnectionManager, DbkitConfig, FetchMode, WriteOp};
 
-// Connect with defaults
+// Connect — the URL scheme picks the backend (postgres:// / mysql:// / sqlite://)
 let conn = ConnectionManager::new("postgres://localhost/myapp").await?;
 
 // Or use the config builder
@@ -33,102 +38,130 @@ let config = DbkitConfig::builder()
     .build();
 let conn = ConnectionManager::connect(config).await?;
 
-let pool = Arc::new(conn.pool().clone());
+// `pool()` yields a sqlx `AnyPool` (cheaply cloneable)
+let handler = BaseHandler::new(conn.pool().clone());
 
-// Run tracked migrations
-let init = InitializationHandler::new(pool.clone());
+// Write. Placeholders are backend-native: `$1` for Postgres, `?` for MySQL/SQLite.
+handler.execute_write(WriteOp::Single {
+    query: "INSERT INTO users (name) VALUES ($1)",
+    params: vec!["Alice".into()],
+    mode: FetchMode::None,
+}).await?;
+```
+
+### Migrations
+
+`InitializationHandler` tracks named migrations by content hash in a
+`_dbkit_migrations` table whose DDL adapts to the backend.
+
+```rust
+use dbkit::InitializationHandler;
+
+let init = InitializationHandler::new(conn.pool().clone(), conn.backend());
 init.run_named_migration("001_users", "
     CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL
     )
 ").await?;
-
-// Query
-let handler = BaseHandler::new(pool);
 ```
+
+The tracking table is portable, but the *migration SQL you supply* is
+backend-native — write it for the database you connected to.
 
 ### Pool health
 
 ```rust
 let status = conn.pool_status();
-println!("connections: {}/{}", status.size, status.max_size);
-println!("available: {}, waiting: {}", status.available, status.waiting);
+println!("connections: {}/{}, idle: {}", status.size, status.max_size, status.idle);
 ```
 
-### DuckDB reads (optional)
+## Analytical reads (optional)
 
-Enable the `duckdb` feature:
+Enable a read engine. DuckDB and DataFusion share the Arrow `RecordBatch`
+contract, so either can be used the same way:
 
 ```toml
-dbkit = { version = "0.2", features = ["duckdb"] }
+dbkit = { version = "0.2", features = ["duckdb"] }       # or "datafusion"
 ```
 
-#### Standard mapped reads
+Attach a read engine to the handler:
 
 ```rust
-use dbkit::{BaseHandler, ReadOp, DuckParam, FetchMode};
+// DuckDB (in-memory, bundled)
+let handler = BaseHandler::with_duckdb(conn.pool().clone())?;
 
-let handler = BaseHandler::with_duckdb(pool, "postgres://localhost/myapp")?;
-
-let result = handler.execute_read(ReadOp::Standard {
-    query: "SELECT name FROM users WHERE id = $1",
-    params: vec![DuckParam::Int(1)],
-    map_fn: |row| Ok(row.get::<_, String>(0)?),
-    mode: FetchMode::One,
-}).await?;
+// or DataFusion (pure-Rust, no FFI)
+let handler = BaseHandler::with_datafusion(conn.pool().clone())?;
 ```
 
-#### Arrow reads
+### Sync, then read
 
-Returns `Vec<RecordBatch>` directly — ideal for ML training pipelines or columnar analytics:
-
-```rust
-use dbkit::RecordBatch;
-
-let batches = handler.execute_arrow(
-    "SELECT * FROM training_data WHERE label = $1",
-    &[DuckParam::Text("positive".into())],
-).await?;
-```
-
-#### Optional parameters
-
-Use `Opt*` variants when values may be `NULL`:
+Copy transactional tables into the analytical engine, then query them:
 
 ```rust
-let params = vec![
-    DuckParam::OptInt(Some(42)),
-    DuckParam::OptText(None),        // binds as NULL
-    DuckParam::OptBool(Some(true)),
-];
-```
+use dbkit::DbValue;
 
-#### Syncing tables from Postgres to DuckDB
+// Whole tables
+handler.sync_tables(&["users", "orders"]).await?;
 
-Copy full tables or filtered subsets into DuckDB local memory for fast analytical queries:
-
-```rust
-// Sync entire tables
-handler.sync_tables(&["users", "orders", "products"]).await?;
-
-// Sync with a filter
-handler.sync_table_filtered(
-    "orders",
-    "created_at > $1",
-    &[DuckParam::Text("2024-01-01".into())],
+// A filtered / arbitrary query, loaded as a named table
+handler.sync_query(
+    "recent_orders",
+    "SELECT * FROM orders WHERE created_at > $1",
+    &[DbValue::Text("2024-01-01".into())],
 ).await?;
 
-// Now query the local copy (memory.main.orders) for fast reads
-let batches = handler.execute_arrow(
-    "SELECT * FROM memory.main.orders",
-    &[],
-).await?;
+// Arrow read
+let batches = handler.execute_read("SELECT * FROM recent_orders", &[]).await?;
+
+// ...or deserialize straight into typed rows
+#[derive(serde::Deserialize)]
+struct Order { id: i64, total: f64 }
+let orders: Vec<Order> =
+    handler.execute_read_as("SELECT id, total FROM recent_orders", &[]).await?;
 ```
+
+### Live Postgres attach (DuckDB)
+
+DuckDB can query Postgres tables directly — no copy — via the `pg` catalog:
+
+```rust
+let handler = BaseHandler::with_duckdb_attached_postgres(
+    conn.pool().clone(),
+    "postgresql://localhost/myapp",
+)?;
+let batches = handler.execute_read("SELECT * FROM pg.public.users", &[]).await?;
+```
+
+### Rich Postgres types (uuid / timestamps / json)
+
+The multi-backend `Any` pool only represents basic scalars (bool / int / float /
+text / bytes) — the price of Postgres/MySQL/SQLite interchangeability. For
+queries involving native Postgres types (`uuid`, `timestamptz`, `jsonb`, arrays,
+decimal), enable `postgres-native` and drop to a real `PgPool` with full sqlx
+type support:
+
+```toml
+dbkit = { version = "0.2", features = ["postgres-native"] }
+```
+
+```rust
+let pg = conn.pg_native_pool().await?;   // native PgPool, rich types
+let row = sqlx::query("SELECT id, created_at FROM users WHERE id = $1")
+    .bind(some_uuid)
+    .fetch_one(&pg)
+    .await?;
+let id: sqlx::types::Uuid = row.get("id");
+let ts: sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc> = row.get("created_at");
+```
+
+Use the `Any` pool (`handler.execute_write`) for portable work, and the native
+pool only where you need Postgres-specific types. (Other type features such as
+`rust_decimal` can be enabled by adding `sqlx` to your own `Cargo.toml` with the
+relevant feature — cargo unifies it with dbkit's.)
 
 ### Name normalization
-
-Unicode NFD decomposition + lowercase for consistent name matching:
 
 ```rust
 let normalized = BaseHandler::normalize_name("José García");
@@ -142,30 +175,29 @@ Both key and value types are generic, defaulting to `String`:
 ```rust
 use dbkit::Cache;
 
-// Default String/String cache — works exactly like before
 let cache: Cache = Cache::with_buckets(&["products", "prices"]);
 cache.set("products", "abc123".into(), "Widget".into());
 let val = cache.get("products", &"abc123".into());
 
-// Typed values: String keys, i32 values
+// Typed keys and values
 let counts: Cache<String, i32> = Cache::with_buckets(&["metrics"]);
 counts.set("metrics", "page_views".into(), 42);
 assert_eq!(counts.get("metrics", &"page_views".into()), Some(42));
-
-// Typed keys and values: i32 keys, custom struct values
-#[derive(Clone)]
-struct User { name: String }
-
-let users: Cache<i32, User> = Cache::new();
-users.set("active", 1, User { name: "Alice".into() });
-let user = users.get("active", &1).unwrap();
 ```
 
 ## Feature flags
 
-| Feature  | Default | Description |
-|----------|---------|-------------|
-| `duckdb` | off     | Enables DuckDB reads, Arrow support, and PG→DuckDB sync via `BaseHandler::with_duckdb()` |
+| Feature      | Default | Description |
+|--------------|---------|-------------|
+| `postgres`   | **on**  | Postgres backend (sqlx) |
+| `postgres-native` | off | Native `PgPool` with full Postgres types (uuid/chrono/json) — see below |
+| `mysql`      | off     | MySQL backend (sqlx) |
+| `sqlite`     | off     | SQLite backend (sqlx) |
+| `duckdb`     | off     | DuckDB analytical read engine (bundled) + typed reads |
+| `datafusion` | off     | DataFusion analytical read engine (pure-Rust) + typed reads |
+
+`duckdb` and `datafusion` currently share an Arrow version and may be enabled
+together.
 
 ## License
 

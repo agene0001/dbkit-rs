@@ -1,9 +1,9 @@
-use crate::base_handler::{BaseHandler, FetchMode, WriteOp};
 use crate::DbkitError;
-use deadpool_postgres::Pool;
+use crate::base_handler::{BaseHandler, FetchMode, WriteOp};
+use crate::config::Backend;
+use sqlx::{AnyPool, Row};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use tracing::{error, info};
 
 /// Batch DDL migration executor with tracking.
@@ -11,14 +11,74 @@ use tracing::{error, info};
 /// Maintains a `_dbkit_migrations` table so already-applied migrations
 /// are skipped on subsequent runs. Each migration is identified by a
 /// user-provided name and a content hash.
+///
+/// The tracking table DDL and the internal queries are backend-aware
+/// (Postgres / MySQL / SQLite), so the migration runner works on any backend.
+/// The *user-supplied* migration SQL is still backend-native — write it for the
+/// database you connected to.
 pub struct InitializationHandler {
     handler: BaseHandler,
+    backend: Backend,
 }
 
 impl InitializationHandler {
-    pub fn new(pool: Arc<Pool>) -> Self {
+    /// Create a handler for the given pool and backend.
+    ///
+    /// The backend is typically obtained from
+    /// [`ConnectionManager::backend`](crate::ConnectionManager::backend).
+    pub fn new(pool: AnyPool, backend: Backend) -> Self {
         Self {
             handler: BaseHandler::new(pool),
+            backend,
+        }
+    }
+
+    /// The placeholder for the `n`-th bind parameter (1-based) for this backend.
+    fn placeholder(&self, n: usize) -> String {
+        match self.backend {
+            Backend::Postgres => format!("${n}"),
+            Backend::MySql | Backend::Sqlite => "?".to_string(),
+        }
+    }
+
+    /// Backend-specific DDL for the migrations tracking table.
+    ///
+    /// `name` is the primary key (no auto-increment column needed), which keeps
+    /// the schema portable. `applied_at` is a timestamp defaulting to "now".
+    fn tracking_table_ddl(&self) -> &'static str {
+        match self.backend {
+            Backend::Postgres => {
+                "CREATE TABLE IF NOT EXISTS _dbkit_migrations (
+                    name TEXT PRIMARY KEY,
+                    hash TEXT NOT NULL,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )"
+            }
+            Backend::MySql => {
+                // TEXT can't be a primary key without a prefix length in MySQL.
+                "CREATE TABLE IF NOT EXISTS _dbkit_migrations (
+                    name VARCHAR(255) PRIMARY KEY,
+                    hash TEXT NOT NULL,
+                    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"
+            }
+            Backend::Sqlite => {
+                "CREATE TABLE IF NOT EXISTS _dbkit_migrations (
+                    name TEXT PRIMARY KEY,
+                    hash TEXT NOT NULL,
+                    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"
+            }
+        }
+    }
+
+    /// A SQL expression that renders `applied_at` as text, so it can be read
+    /// through sqlx's `Any` driver (which can't decode native timestamp types).
+    fn applied_at_as_text(&self) -> &'static str {
+        match self.backend {
+            // MySQL casts to CHAR; Postgres and SQLite cast to TEXT.
+            Backend::MySql => "CAST(applied_at AS CHAR)",
+            Backend::Postgres | Backend::Sqlite => "CAST(applied_at AS TEXT)",
         }
     }
 
@@ -26,14 +86,7 @@ impl InitializationHandler {
     async fn ensure_tracking_table(&self) -> Result<(), DbkitError> {
         self.handler
             .execute_write(WriteOp::BatchDDL {
-                queries: &[
-                    "CREATE TABLE IF NOT EXISTS _dbkit_migrations (
-                        id SERIAL PRIMARY KEY,
-                        name TEXT NOT NULL UNIQUE,
-                        hash TEXT NOT NULL,
-                        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )",
-                ],
+                queries: &[self.tracking_table_ddl()],
             })
             .await?;
         Ok(())
@@ -56,11 +109,15 @@ impl InitializationHandler {
         let hash = Self::hash_sql(sql);
 
         // Check if already applied
+        let select = format!(
+            "SELECT hash FROM _dbkit_migrations WHERE name = {}",
+            self.placeholder(1)
+        );
         let result = self
             .handler
             .execute_write(WriteOp::Single {
-                query: "SELECT hash FROM _dbkit_migrations WHERE name = $1",
-                params: &[&name],
+                query: select.as_str(),
+                params: vec![name.into()],
                 mode: FetchMode::Optional,
             })
             .await?;
@@ -109,10 +166,15 @@ impl InitializationHandler {
         }
 
         // Record the migration
+        let insert = format!(
+            "INSERT INTO _dbkit_migrations (name, hash) VALUES ({}, {})",
+            self.placeholder(1),
+            self.placeholder(2)
+        );
         self.handler
             .execute_write(WriteOp::Single {
-                query: "INSERT INTO _dbkit_migrations (name, hash) VALUES ($1, $2)",
-                params: &[&name, &hash],
+                query: insert.as_str(),
+                params: vec![name.into(), hash.clone().into()],
                 mode: FetchMode::None,
             })
             .await?;
@@ -124,7 +186,8 @@ impl InitializationHandler {
     /// Run migrations from a SQL string (semicolon-separated DDL statements).
     ///
     /// This is the simple/legacy API — it runs all statements unconditionally
-    /// without tracking. Use [`run_named_migration`] for tracked migrations.
+    /// without tracking. Use [`run_named_migration`](Self::run_named_migration)
+    /// for tracked migrations.
     pub async fn run_migrations(&self, sql: &str) -> Result<(), DbkitError> {
         info!("running database migrations...");
 
@@ -155,15 +218,19 @@ impl InitializationHandler {
         Ok(())
     }
 
-    /// List all applied migrations (name, hash, applied_at).
+    /// List all applied migrations (name, hash, applied_at) in application order.
     pub async fn applied_migrations(&self) -> Result<Vec<(String, String, String)>, DbkitError> {
         self.ensure_tracking_table().await?;
 
+        let select = format!(
+            "SELECT name, hash, {} FROM _dbkit_migrations ORDER BY applied_at, name",
+            self.applied_at_as_text()
+        );
         let result = self
             .handler
             .execute_write(WriteOp::Single {
-                query: "SELECT name, hash, applied_at::TEXT FROM _dbkit_migrations ORDER BY id",
-                params: &[],
+                query: select.as_str(),
+                params: vec![],
                 mode: FetchMode::All,
             })
             .await?;

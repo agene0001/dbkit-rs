@@ -1,3 +1,44 @@
+use crate::DbkitError;
+
+/// A supported transactional database backend, detected from the URL scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Postgres,
+    MySql,
+    Sqlite,
+}
+
+impl Backend {
+    /// Detect the backend from a connection URL's scheme
+    /// (`postgres://`, `mysql://`, `sqlite://`).
+    pub fn from_url(url: &str) -> Result<Self, DbkitError> {
+        match url.split(':').next().unwrap_or("") {
+            "postgres" | "postgresql" => Ok(Backend::Postgres),
+            "mysql" => Ok(Backend::MySql),
+            "sqlite" => Ok(Backend::Sqlite),
+            other => Err(DbkitError::UnsupportedBackend(other.to_string())),
+        }
+    }
+
+    /// The URL scheme used when building a URL from parts.
+    fn scheme(self) -> &'static str {
+        match self {
+            Backend::Postgres => "postgres",
+            Backend::MySql => "mysql",
+            Backend::Sqlite => "sqlite",
+        }
+    }
+
+    /// The default TCP port for server backends (0 for SQLite, which is fileless).
+    fn default_port(self) -> u16 {
+        match self {
+            Backend::Postgres => 5432,
+            Backend::MySql => 3306,
+            Backend::Sqlite => 0,
+        }
+    }
+}
+
 /// Configuration for a dbkit database connection.
 ///
 /// Can be built from a URL string or constructed with the builder.
@@ -22,7 +63,8 @@
 /// ```
 #[derive(Debug, Clone)]
 pub struct DbkitConfig {
-    /// Postgres connection URL.
+    /// Connection URL. The scheme selects the backend
+    /// (`postgres://`, `mysql://`, `sqlite://`).
     pub url: String,
     /// Maximum pool size. Default: 16.
     pub pool_size: usize,
@@ -54,8 +96,9 @@ impl DbkitConfig {
 
 /// Builder for constructing a [`DbkitConfig`] from individual parameters.
 pub struct ConfigBuilder {
+    backend: Backend,
     host: String,
-    port: u16,
+    port: Option<u16>,
     database: String,
     user: Option<String>,
     password: Option<String>,
@@ -81,8 +124,9 @@ pub enum SslMode {
 impl Default for ConfigBuilder {
     fn default() -> Self {
         Self {
+            backend: Backend::Postgres,
             host: "localhost".into(),
-            port: 5432,
+            port: None,
             database: "postgres".into(),
             user: None,
             password: None,
@@ -96,13 +140,19 @@ impl Default for ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    /// Select the target backend. Defaults to [`Backend::Postgres`].
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
+    }
+
     pub fn host(mut self, host: &str) -> Self {
         self.host = host.to_string();
         self
     }
 
     pub fn port(mut self, port: u16) -> Self {
-        self.port = port;
+        self.port = Some(port);
         self
     }
 
@@ -147,23 +197,39 @@ impl ConfigBuilder {
     }
 
     /// Build the config, constructing the connection URL from parts.
+    ///
+    /// For [`Backend::Sqlite`] the URL is `sqlite://{database}`, treating
+    /// `database` as a file path; host/port/auth/SSL are ignored. SQLite users
+    /// are usually better served by [`DbkitConfig::from_url`].
     pub fn build(self) -> DbkitConfig {
-        let auth = match (&self.user, &self.password) {
-            (Some(u), Some(p)) => format!("{}:{}@", u, p),
-            (Some(u), None) => format!("{}@", u),
-            _ => String::new(),
-        };
+        let url = match self.backend {
+            Backend::Sqlite => format!("sqlite://{}", self.database),
+            backend => {
+                let auth = match (&self.user, &self.password) {
+                    (Some(u), Some(p)) => format!("{}:{}@", u, p),
+                    (Some(u), None) => format!("{}@", u),
+                    _ => String::new(),
+                };
 
-        let ssl_param = match self.ssl_mode {
-            SslMode::Disable => "",
-            SslMode::Prefer => "?sslmode=prefer",
-            SslMode::Require => "?sslmode=require",
-        };
+                let port = self.port.unwrap_or_else(|| backend.default_port());
 
-        let url = format!(
-            "postgres://{}{}:{}/{}{}",
-            auth, self.host, self.port, self.database, ssl_param
-        );
+                let ssl_param = match self.ssl_mode {
+                    SslMode::Disable => "",
+                    SslMode::Prefer => "?sslmode=prefer",
+                    SslMode::Require => "?sslmode=require",
+                };
+
+                format!(
+                    "{}://{}{}:{}/{}{}",
+                    backend.scheme(),
+                    auth,
+                    self.host,
+                    port,
+                    self.database,
+                    ssl_param
+                )
+            }
+        };
 
         DbkitConfig {
             url,
@@ -221,5 +287,33 @@ mod tests {
             .database("prod")
             .build();
         assert_eq!(config.url, "postgres://readonly@localhost:5432/prod");
+    }
+
+    #[test]
+    fn test_builder_mysql_default_port() {
+        let config = DbkitConfig::builder()
+            .backend(Backend::MySql)
+            .user("root")
+            .database("app")
+            .build();
+        assert_eq!(config.url, "mysql://root@localhost:3306/app");
+    }
+
+    #[test]
+    fn test_builder_sqlite() {
+        let config = DbkitConfig::builder()
+            .backend(Backend::Sqlite)
+            .database("data/app.db")
+            .build();
+        assert_eq!(config.url, "sqlite://data/app.db");
+    }
+
+    #[test]
+    fn test_backend_from_url() {
+        assert_eq!(Backend::from_url("postgres://x/y").unwrap(), Backend::Postgres);
+        assert_eq!(Backend::from_url("postgresql://x/y").unwrap(), Backend::Postgres);
+        assert_eq!(Backend::from_url("mysql://x/y").unwrap(), Backend::MySql);
+        assert_eq!(Backend::from_url("sqlite://f.db").unwrap(), Backend::Sqlite);
+        assert!(Backend::from_url("oracle://x/y").is_err());
     }
 }

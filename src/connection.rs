@@ -1,18 +1,18 @@
-use crate::config::DbkitConfig;
+use crate::config::{Backend, DbkitConfig};
 use crate::DbkitError;
-use deadpool_postgres::{
-    Config as PostgresConfig, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime,
-};
+use sqlx::migrate::MigrateDatabase;
+use sqlx::{Any, AnyPool, any::AnyPoolOptions};
 use std::time::Duration;
-use tokio_postgres::{NoTls, error::SqlState};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-/// Postgres connection pool with automatic database creation.
+/// Multi-backend connection pool with optional automatic database creation.
 ///
+/// The backend (Postgres, MySQL, or SQLite) is selected from the URL scheme.
 /// If `auto_create_db` is enabled (default) and the target database doesn't
-/// exist, it connects to the `postgres` system database and creates it.
+/// exist, it is created before the pool is opened.
 pub struct ConnectionManager {
-    pool: Pool,
+    pool: AnyPool,
+    backend: Backend,
     db_name: String,
     connection_string: String,
     config: DbkitConfig,
@@ -21,73 +21,26 @@ pub struct ConnectionManager {
 impl ConnectionManager {
     /// Connect using a [`DbkitConfig`].
     pub async fn connect(config: DbkitConfig) -> Result<Self, DbkitError> {
-        let db_name = Self::extract_db_name(&config.url);
+        // Registers the Postgres/MySQL/SQLite drivers compiled in via features.
+        sqlx::any::install_default_drivers();
+
+        let backend = Backend::from_url(&config.url)?;
+        let db_name = Self::extract_db_name(&config.url, backend);
         let connection_string = config.url.clone();
 
-        let mut cfg = PostgresConfig::new();
-        cfg.url = Some(config.url.clone());
-        cfg.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: config.pool_size,
-            timeouts: deadpool_postgres::Timeouts {
-                wait: Some(Duration::from_secs(config.connect_timeout_secs)),
-                create: Some(Duration::from_secs(config.connect_timeout_secs)),
-                recycle: Some(Duration::from_secs(config.connect_timeout_secs)),
-            },
-            ..Default::default()
-        });
-        cfg.manager = Some(ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        });
+        if config.auto_create_db {
+            Self::ensure_database(&config.url, &db_name).await?;
+        }
 
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| DbkitError::PoolCreation(e.to_string()))?;
+        let pool = Self::build_pool(&config)
+            .await
+            .map_err(|e| Self::map_connect_error(e, &db_name))?;
 
-        let final_pool = match pool.get().await {
-            Ok(_) => {
-                info!("connected to database '{}'", db_name);
-                pool
-            }
-            Err(PoolError::Backend(e)) => {
-                if let Some(code) = e.code() {
-                    if *code == SqlState::INVALID_CATALOG_NAME {
-                        if config.auto_create_db {
-                            warn!("database '{}' does not exist, creating...", db_name);
-                            Self::create_database_if_missing(&config.url, &db_name).await?;
-                            cfg.create_pool(Some(Runtime::Tokio1), NoTls)
-                                .map_err(|e| DbkitError::PoolCreation(e.to_string()))?
-                        } else {
-                            return Err(DbkitError::DatabaseCreation {
-                                name: db_name,
-                                reason: "database does not exist and auto_create_db is disabled"
-                                    .into(),
-                            });
-                        }
-                    } else if *code == SqlState::INVALID_PASSWORD {
-                        error!("authentication failed");
-                        return Err(DbkitError::AuthFailed);
-                    } else if *code == SqlState::TOO_MANY_CONNECTIONS {
-                        return Err(DbkitError::TooManyConnections);
-                    } else {
-                        return Err(DbkitError::Connection(format!(
-                            "code {:?}: {}",
-                            code, e
-                        )));
-                    }
-                } else {
-                    return Err(DbkitError::Connection(e.to_string()));
-                }
-            }
-            Err(e) => {
-                return Err(DbkitError::Connection(format!(
-                    "could not connect to '{}': {}",
-                    db_name, e
-                )));
-            }
-        };
+        info!("connected to database '{}' ({:?})", db_name, backend);
 
         Ok(Self {
-            pool: final_pool,
+            pool,
+            backend,
             db_name,
             connection_string,
             config,
@@ -101,22 +54,27 @@ impl ConnectionManager {
         Self::connect(DbkitConfig::from_url(url)).await
     }
 
-    /// Get the underlying connection pool.
-    pub fn pool(&self) -> &Pool {
+    /// Get the underlying sqlx connection pool.
+    pub fn pool(&self) -> &AnyPool {
         &self.pool
     }
 
-    /// Get a connection from the pool.
-    pub async fn get_connection(&self) -> Result<deadpool_postgres::Object, DbkitError> {
+    /// The detected backend for this connection.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// Acquire a connection from the pool.
+    pub async fn get_connection(&self) -> Result<sqlx::pool::PoolConnection<Any>, DbkitError> {
         self.pool
-            .get()
+            .acquire()
             .await
             .map_err(|e| DbkitError::Pool(e.to_string()))
     }
 
     /// Check if the database is reachable.
     pub async fn is_connected(&self) -> bool {
-        self.pool.get().await.is_ok()
+        self.pool.acquire().await.is_ok()
     }
 
     /// The database name extracted from the connection URL.
@@ -134,55 +92,74 @@ impl ConnectionManager {
         &self.config
     }
 
+    /// Create a native sqlx [`PgPool`](sqlx::PgPool) from this connection's URL.
+    ///
+    /// The multi-backend `Any` pool can only represent basic scalar types
+    /// (bool/int/float/text/bytes). This native pool restores full Postgres type
+    /// support — `uuid`, `chrono` timestamps, `json`/`jsonb`, arrays, etc. — for
+    /// the queries that need it. Use it alongside [`pool`](Self::pool): `Any` for
+    /// portable work, the native pool for rich-typed Postgres work.
+    ///
+    /// Errors if this connection is not Postgres.
+    ///
+    /// ```ignore
+    /// let pg = conn.pg_native_pool().await?;
+    /// let row = sqlx::query("SELECT id, created_at FROM users WHERE id = $1")
+    ///     .bind(some_uuid)
+    ///     .fetch_one(&pg)
+    ///     .await?;
+    /// let id: sqlx::types::Uuid = row.get("id");
+    /// ```
+    #[cfg(feature = "postgres-native")]
+    pub async fn pg_native_pool(&self) -> Result<sqlx::PgPool, DbkitError> {
+        if self.backend != Backend::Postgres {
+            return Err(DbkitError::UnsupportedBackend(format!(
+                "pg_native_pool requires a Postgres connection, got {:?}",
+                self.backend
+            )));
+        }
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(self.config.pool_size as u32)
+            .acquire_timeout(Duration::from_secs(self.config.connect_timeout_secs))
+            .idle_timeout(Duration::from_secs(self.config.idle_timeout_secs))
+            .connect(&self.connection_string)
+            .await
+            .map_err(|e| DbkitError::Pool(e.to_string()))
+    }
+
     /// Pool health metrics.
     pub fn pool_status(&self) -> PoolStatus {
-        let status = self.pool.status();
         PoolStatus {
-            max_size: status.max_size,
-            size: status.size,
-            available: status.available as usize,
-            waiting: status.waiting,
+            max_size: self.pool.options().get_max_connections() as usize,
+            size: self.pool.size() as usize,
+            idle: self.pool.num_idle(),
         }
     }
 
-    fn extract_db_name(url: &str) -> String {
-        url.rsplit('/')
-            .next()
-            .unwrap_or("postgres")
-            .split('?')
-            .next()
-            .unwrap_or("postgres")
-            .to_string()
+    async fn build_pool(config: &DbkitConfig) -> Result<AnyPool, sqlx::Error> {
+        AnyPoolOptions::new()
+            .max_connections(config.pool_size as u32)
+            .acquire_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            .connect(&config.url)
+            .await
     }
 
-    async fn create_database_if_missing(url: &str, db_name: &str) -> Result<(), DbkitError> {
-        let base_url = if let Some(pos) = url.rfind('/') {
-            format!("{}postgres", &url[..=pos])
-        } else {
-            return Err(DbkitError::DatabaseCreation {
+    /// Create the database if it does not already exist.
+    ///
+    /// Uses sqlx's backend-agnostic `MigrateDatabase`, which handles
+    /// `CREATE DATABASE` for Postgres/MySQL and file creation for SQLite.
+    async fn ensure_database(url: &str, db_name: &str) -> Result<(), DbkitError> {
+        let exists = Any::database_exists(url).await.map_err(|e| {
+            DbkitError::DatabaseCreation {
                 name: db_name.to_string(),
-                reason: "invalid database URL".into(),
-            });
-        };
-
-        let (client, connection) = tokio_postgres::connect(&base_url, NoTls).await?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("connection error during DB creation: {}", e);
+                reason: e.to_string(),
             }
-        });
-
-        let exists = client
-            .query_one("SELECT 1 FROM pg_database WHERE datname = $1", &[&db_name])
-            .await
-            .is_ok();
+        })?;
 
         if !exists {
-            info!("creating database '{}'...", db_name);
-            let create_query = format!("CREATE DATABASE \"{}\"", db_name);
-            client
-                .batch_execute(&create_query)
+            warn!("database '{}' does not exist, creating...", db_name);
+            Any::create_database(url)
                 .await
                 .map_err(|e| DbkitError::DatabaseCreation {
                     name: db_name.to_string(),
@@ -192,6 +169,45 @@ impl ConnectionManager {
         }
 
         Ok(())
+    }
+
+    /// Map a sqlx connection error onto a more specific [`DbkitError`] where the
+    /// backend exposes a recognizable SQLSTATE.
+    fn map_connect_error(e: sqlx::Error, db_name: &str) -> DbkitError {
+        if let sqlx::Error::Database(ref db) = e {
+            match db.code().as_deref() {
+                // Postgres: invalid_password / invalid_authorization_specification
+                Some("28P01") | Some("28000") => return DbkitError::AuthFailed,
+                // Postgres: too_many_connections
+                Some("53300") => return DbkitError::TooManyConnections,
+                _ => {}
+            }
+        }
+        DbkitError::Connection(format!("could not connect to '{}': {}", db_name, e))
+    }
+
+    fn extract_db_name(url: &str, backend: Backend) -> String {
+        match backend {
+            // sqlite://path/to/file.db  ->  path/to/file.db
+            Backend::Sqlite => url
+                .splitn(2, ':')
+                .nth(1)
+                .unwrap_or("")
+                .trim_start_matches("//")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            // ...://host:port/dbname?params  ->  dbname
+            _ => url
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        }
     }
 }
 
@@ -203,17 +219,43 @@ pub struct PoolStatus {
     /// Current number of connections (active + idle).
     pub size: usize,
     /// Number of idle connections available.
-    pub available: usize,
-    /// Number of tasks waiting for a connection.
-    pub waiting: usize,
+    pub idle: usize,
 }
 
 impl std::fmt::Display for PoolStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pool: {}/{} connections, {} available, {} waiting",
-            self.size, self.max_size, self.available, self.waiting
+            "pool: {}/{} connections, {} idle",
+            self.size, self.max_size, self.idle
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_db_name_server() {
+        assert_eq!(
+            ConnectionManager::extract_db_name("postgres://u:p@host:5432/myapp", Backend::Postgres),
+            "myapp"
+        );
+        assert_eq!(
+            ConnectionManager::extract_db_name(
+                "mysql://host:3306/app?ssl-mode=required",
+                Backend::MySql
+            ),
+            "app"
+        );
+    }
+
+    #[test]
+    fn extract_db_name_sqlite() {
+        assert_eq!(
+            ConnectionManager::extract_db_name("sqlite://data/app.db", Backend::Sqlite),
+            "data/app.db"
+        );
     }
 }
