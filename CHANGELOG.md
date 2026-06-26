@@ -4,10 +4,10 @@ All notable changes to this project are documented here.
 
 ## [0.3.1]
 
-Additive release (no breaking changes). Restores a native-Postgres,
-rich-typed handler and the ergonomic row-mapped read API from 0.2.x, so
-applications with pervasive Postgres-specific types and closure-mapped reads can
-adopt 0.3 by aliasing rather than rewriting.
+Additive release (no breaking changes). Adds a native-Postgres, rich-typed
+handler combining an OLTP read/write path (sqlx `PgPool`) with the analytical
+Arrow read path (DuckDB), so applications with pervasive Postgres-specific types
+can adopt 0.3 without rewriting their reads into typed structs.
 
 ### Added
 
@@ -15,11 +15,15 @@ adopt 0.3 by aliasing rather than rewriting.
   `BaseHandler` backed by a native `sqlx::PgPool`. Binds date/timestamp/json/
   uuid/time/array `DbValue`s to their native Postgres types (no text fallback)
   and returns `PgRow`s. `new` / `with_duckdb` / `with_duckdb_attached_postgres`
-  constructors; `execute_write` (sqlx) and `execute_read` (DuckDB, row-mapped).
-- **Row-mapped read API** — `ReadOp::Standard { query, params, map_fn, mode }`
-  (closure over a native `duckdb::Row`) and `ReadOp::Arrow`, returning
-  `ReadResult` (`.standard()` / `.arrow()`). Driven by `PgHandler::execute_read`.
-  Restores the 0.2.x ergonomics alongside the Arrow-only `execute_read`.
+  constructors.
+- **`PgHandler::query`** — the OLTP read path: runs a query against the native
+  Postgres pool and returns `QueryResult<PgRow>` per `FetchMode` (single
+  round-trip, no analytical engine). Read columns with `row.get(i)` /
+  `row.try_get(i)`. `execute_write`'s `Single` now delegates to it.
+- **`PgHandler::execute_read`** — the analytical path: runs a query against the
+  attached DuckDB engine and returns Arrow `RecordBatch`es (for large
+  joins/aggregations consumed as DataFrames). Pairs with `BaseHandler`'s
+  `execute_read_as` for typed deserialization.
 - **Rich `DbValue` variants** (`postgres-native`): `Date`, `DateTime`,
   `TimestampTz`, `Json`, `Uuid`, `Time`, `TextArray`, `FloatArray`,
   `OptFloatArray`, each with a `From` conversion. Native binds via `PgHandler`;

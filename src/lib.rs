@@ -64,10 +64,6 @@ pub use analytical::{RecordBatch, arrow};
 #[cfg(any(feature = "duckdb", feature = "datafusion"))]
 pub use read::ReadEngine;
 
-// Row-mapped read API (DuckDB) used by `PgHandler::execute_read`.
-#[cfg(feature = "duckdb")]
-pub use read::{ReadOp, ReadResult};
-
 // Remote analytical sources (read) and sinks (bulk write).
 #[cfg(feature = "clickhouse")]
 pub use remote::{
@@ -82,5 +78,7 @@ pub use sqlx::{AnyPool, any::AnyRow};
 // date/timestamp/json/uuid `DbValue`s natively and returns `PgRow`).
 #[cfg(feature = "postgres-native")]
 pub use pg_handler::PgHandler;
+// `Row` is the trait that provides `PgRow::get` / `try_get`; callers need it in
+// scope to read columns off the `PgRow`s returned by `PgHandler::query`.
 #[cfg(feature = "postgres-native")]
-pub use sqlx::{PgPool, postgres::PgRow};
+pub use sqlx::{PgPool, Row, postgres::PgRow};

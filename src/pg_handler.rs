@@ -21,7 +21,9 @@ use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(feature = "duckdb")]
-use crate::read::{ReadOp, ReadResult, duckdb::DuckEngine};
+use crate::analytical::RecordBatch;
+#[cfg(feature = "duckdb")]
+use crate::read::{ReadEngine, duckdb::DuckEngine};
 
 /// Bind a slice of [`DbValue`]s onto a sqlx Postgres query, in order, binding
 /// the rich variants to their native Postgres types (no text fallback). Values
@@ -131,20 +133,7 @@ impl PgHandler {
                 query,
                 params,
                 mode,
-            } => {
-                let q = bind_pg(sqlx::query(AssertSqlSafe(query)), &params);
-                match mode {
-                    FetchMode::None => {
-                        q.execute(&self.pool).await?;
-                        Ok(QueryResult::None)
-                    }
-                    FetchMode::One => Ok(QueryResult::One(q.fetch_one(&self.pool).await?)),
-                    FetchMode::Optional => {
-                        Ok(QueryResult::Optional(q.fetch_optional(&self.pool).await?))
-                    }
-                    FetchMode::All => Ok(QueryResult::All(q.fetch_all(&self.pool).await?)),
-                }
-            }
+            } => self.query(query, params, mode).await,
 
             WriteOp::BatchDDL { queries } => {
                 let mut tx = self.pool.begin().await?;
@@ -186,35 +175,49 @@ impl PgHandler {
         }
     }
 
-    // ==================== UNIFIED READ (DuckDB) ====================
+    // ==================== NATIVE POSTGRES READ ====================
 
-    /// Execute a read operation against the attached DuckDB engine — either a
-    /// row-mapped [`ReadOp::Standard`] (typed via `map_fn`) or an
-    /// [`ReadOp::Arrow`] columnar read. Errors with
-    /// [`DbkitError::NoReadEngine`] if no engine is attached.
-    #[cfg(feature = "duckdb")]
-    pub async fn execute_read<T, F>(
+    /// Run a query against the native Postgres pool, returning rows per `mode`.
+    ///
+    /// This is the OLTP read path — single-row lookups and small result sets go
+    /// straight to Postgres (one round-trip → [`PgRow`]), no analytical engine.
+    /// Placeholders are Postgres-native (`$1, $2, …`); read columns off the
+    /// returned [`PgRow`]s with `row.get(i)` / `row.try_get(i)`.
+    pub async fn query(
         &self,
-        op: ReadOp<'_, T, F>,
-    ) -> Result<ReadResult<T>, DbkitError>
-    where
-        F: Fn(&::duckdb::Row<'_>) -> Result<T, DbkitError> + Send + 'static,
-        T: Send + 'static,
-    {
-        use crate::read::ReadEngine;
-        let duck = self.duck.as_ref().ok_or(DbkitError::NoReadEngine)?;
-        match op {
-            ReadOp::Standard {
-                query,
-                params,
-                map_fn,
-                mode,
-            } => Ok(ReadResult::Standard(
-                duck.query_mapped(query, &params, map_fn, mode).await?,
-            )),
-            ReadOp::Arrow { query, params } => {
-                Ok(ReadResult::Arrow(duck.query_arrow(query, &params).await?))
+        query: &str,
+        params: Vec<DbValue>,
+        mode: FetchMode,
+    ) -> Result<QueryResult<PgRow>, DbkitError> {
+        let q = bind_pg(sqlx::query(AssertSqlSafe(query)), &params);
+        match mode {
+            FetchMode::None => {
+                q.execute(&self.pool).await?;
+                Ok(QueryResult::None)
             }
+            FetchMode::One => Ok(QueryResult::One(q.fetch_one(&self.pool).await?)),
+            FetchMode::Optional => Ok(QueryResult::Optional(q.fetch_optional(&self.pool).await?)),
+            FetchMode::All => Ok(QueryResult::All(q.fetch_all(&self.pool).await?)),
         }
+    }
+
+    // ==================== ANALYTICAL READ (DuckDB / Arrow) ====================
+
+    /// Run an analytical query against the attached DuckDB engine, returning
+    /// columnar Arrow [`RecordBatch`]es. For large joins/aggregations consumed as
+    /// DataFrames. Errors with [`DbkitError::NoReadEngine`] if no engine is
+    /// attached. For typed rows, deserialize the batches (see
+    /// [`BaseHandler::execute_read_as`](crate::BaseHandler::execute_read_as)).
+    #[cfg(feature = "duckdb")]
+    pub async fn execute_read(
+        &self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<RecordBatch>, DbkitError> {
+        self.duck
+            .as_ref()
+            .ok_or(DbkitError::NoReadEngine)?
+            .query_arrow(sql, params)
+            .await
     }
 }

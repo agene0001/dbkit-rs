@@ -2,7 +2,6 @@
 
 use crate::DbkitError;
 use crate::analytical::RecordBatch;
-use crate::base_handler::{FetchMode, QueryResult};
 use crate::read::ReadEngine;
 use crate::value::DbValue;
 use ::duckdb::vtab::arrow::{ArrowVTab, arrow_recordbatch_to_query_params};
@@ -56,74 +55,6 @@ impl DuckEngine {
         Ok(())
     }
 
-    /// Run a query mapping each DuckDB row through `map_fn`, collecting per
-    /// `mode`. Generic (so it lives on the concrete engine, not the object-safe
-    /// [`ReadEngine`] trait). Runs on the blocking pool since DuckDB is sync.
-    pub(crate) async fn query_mapped<T, F>(
-        &self,
-        query: &str,
-        params: &[DbValue],
-        map_fn: F,
-        mode: FetchMode,
-    ) -> Result<QueryResult<T>, DbkitError>
-    where
-        F: Fn(&::duckdb::Row<'_>) -> Result<T, DbkitError> + Send + 'static,
-        T: Send + 'static,
-    {
-        let conn = self.conn.clone();
-        let query = query.to_string();
-        let params = params.to_vec();
-
-        let results = task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
-            let mut stmt = conn
-                .prepare(&query)
-                .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-            let values = convert_params(&params);
-            let param_refs: Vec<&dyn ::duckdb::ToSql> =
-                values.iter().map(|v| v as &dyn ::duckdb::ToSql).collect();
-
-            let rows = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    map_fn(row).map_err(|e| ::duckdb::Error::InvalidParameterName(e.to_string()))
-                })
-                .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(|e| DbkitError::DuckDb(e.to_string()))?);
-            }
-            Ok::<Vec<T>, DbkitError>(out)
-        })
-        .await
-        .map_err(|e| DbkitError::TaskJoin(e.to_string()))??;
-
-        Ok(match mode {
-            FetchMode::None => QueryResult::None,
-            FetchMode::One => {
-                if results.len() != 1 {
-                    return Err(DbkitError::RowCount {
-                        expected: "1".into(),
-                        actual: results.len(),
-                    });
-                }
-                QueryResult::One(results.into_iter().next().unwrap())
-            }
-            FetchMode::Optional => {
-                if results.len() > 1 {
-                    return Err(DbkitError::RowCount {
-                        expected: "0 or 1".into(),
-                        actual: results.len(),
-                    });
-                }
-                QueryResult::Optional(results.into_iter().next())
-            }
-            FetchMode::All => QueryResult::All(results),
-        })
-    }
 }
 
 #[async_trait]
