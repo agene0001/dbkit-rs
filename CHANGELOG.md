@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.4]
+
+### Fixed
+
+- **`PgHandler` now binds a `DbValue::Null` as a typeless NULL** (parameter type
+  OID 0, resolved from context by the server) instead of `Option::<i64>::None`,
+  which pinned every NULL to `int8`. The pinned type broke type unification —
+  e.g. `COALESCE($1, external_id)` against a `varchar` column failed with
+  "COALESCE types bigint and character varying cannot be matched". A typeless
+  NULL behaves like a bare `NULL` literal, unifying with any column type, while
+  remaining correct for `INSERT`/`UPDATE`/`WHERE`.
+
 ## [0.3.3]
 
 ### Fixed
