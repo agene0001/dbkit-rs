@@ -122,6 +122,9 @@ impl ConnectionManager {
             .max_connections(self.config.pool_size as u32)
             .acquire_timeout(Duration::from_secs(self.config.connect_timeout_secs))
             .idle_timeout(Duration::from_secs(self.config.idle_timeout_secs))
+            // Don't ping before every acquire — that's a round-trip per query.
+            // Matches the old deadpool `RecyclingMethod::Fast` behavior.
+            .test_before_acquire(false)
             .connect(&self.connection_string)
             .await
             .map_err(|e| DbkitError::Pool(e.to_string()))
@@ -141,6 +144,8 @@ impl ConnectionManager {
             .max_connections(config.pool_size as u32)
             .acquire_timeout(Duration::from_secs(config.connect_timeout_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            // Skip the per-acquire liveness ping (a round-trip per query).
+            .test_before_acquire(false)
             .connect(&config.url)
             .await
     }

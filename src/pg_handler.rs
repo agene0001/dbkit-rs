@@ -79,6 +79,61 @@ fn bind_pg<'q>(
     q
 }
 
+/// Render one [`DbValue`] as a cell in Postgres `COPY` text format, appending to
+/// `out`. NULL is the `\N` sentinel; all other values are escaped.
+fn copy_render_cell(val: &DbValue, out: &mut String) {
+    match val {
+        DbValue::Null => out.push_str("\\N"),
+        DbValue::Bool(b) => out.push(if *b { 't' } else { 'f' }),
+        DbValue::Int(i) => out.push_str(&i.to_string()),
+        DbValue::Float(f) => {
+            if f.is_nan() {
+                out.push_str("NaN");
+            } else if f.is_infinite() {
+                out.push_str(if *f > 0.0 { "Infinity" } else { "-Infinity" });
+            } else {
+                out.push_str(&f.to_string());
+            }
+        }
+        DbValue::Text(s) => copy_escape_into(s, out),
+        DbValue::Bytes(b) => {
+            // bytea hex input: `\x<hex>`; the leading `\` is escaped to `\\` below.
+            let mut hex = String::with_capacity(2 + b.len() * 2);
+            hex.push_str("\\x");
+            for byte in b {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            copy_escape_into(&hex, out);
+        }
+        DbValue::Date(d) => copy_escape_into(&d.to_string(), out),
+        DbValue::DateTime(dt) => copy_escape_into(&dt.to_string(), out),
+        DbValue::TimestampTz(dt) => copy_escape_into(&dt.to_rfc3339(), out),
+        DbValue::Json(j) => copy_escape_into(&j.to_string(), out),
+        DbValue::Uuid(u) => copy_escape_into(&u.to_string(), out),
+        DbValue::Time(t) => copy_escape_into(&t.to_string(), out),
+        DbValue::TextArray(v) => copy_escape_into(&crate::value::pg_text_array_literal(v), out),
+        DbValue::FloatArray(v) => {
+            copy_escape_into(&crate::value::pg_float_array_literal(v.iter().map(|x| Some(*x))), out)
+        }
+        DbValue::OptFloatArray(v) => {
+            copy_escape_into(&crate::value::pg_float_array_literal(v.iter().copied()), out)
+        }
+    }
+}
+
+/// Escape a value for Postgres `COPY` text format (backslash, tab, newline, CR).
+fn copy_escape_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(c),
+        }
+    }
+}
+
 /// Core query executor for native Postgres: rich-typed transactional writes via
 /// sqlx, and row-mapped analytical reads via DuckDB.
 pub struct PgHandler {
@@ -225,6 +280,44 @@ impl PgHandler {
                 Ok(QueryResult::None)
             }
         }
+    }
+
+    /// Bulk-insert rows via Postgres `COPY ... FROM STDIN` (text format).
+    ///
+    /// The fast path for large inserts: one streamed `COPY` instead of a
+    /// parse + execute (+ savepoint) per row like [`WriteOp::BatchParams`]. Each
+    /// row in `rows` must align positionally with `columns`.
+    ///
+    /// Unlike `BatchParams`, `COPY` is **all-or-nothing** — it does not skip bad
+    /// rows; any error aborts the whole load. Returns the number of rows copied.
+    pub async fn copy_in(
+        &self,
+        table: &str,
+        columns: &[&str],
+        rows: &[Vec<DbValue>],
+    ) -> Result<u64, DbkitError> {
+        use sqlx::postgres::PgPoolCopyExt;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let stmt = format!("COPY {table} ({}) FROM STDIN", columns.join(", "));
+
+        let mut payload = String::new();
+        for row in rows {
+            for (i, val) in row.iter().enumerate() {
+                if i > 0 {
+                    payload.push('\t');
+                }
+                copy_render_cell(val, &mut payload);
+            }
+            payload.push('\n');
+        }
+
+        let mut sink = self.pool.copy_in_raw(&stmt).await?;
+        sink.send(payload.as_bytes()).await?;
+        Ok(sink.finish().await?)
     }
 
     // ==================== NATIVE POSTGRES READ ====================

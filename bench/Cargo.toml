@@ -1,0 +1,15 @@
+[package]
+name = "dbkit-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Own workspace root so cargo doesn't treat this as part of the parent crate.
+[workspace]
+
+[dependencies]
+# Published 0.2 (tokio-postgres/deadpool) and the local 0.3 (sqlx), side by side.
+dbkit_v2 = { package = "dbkit-rs", version = "=0.2.1" }
+dbkit_v3 = { package = "dbkit-rs", path = "..", features = ["postgres-native"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "0.7" # to name `ToSql` for the v2 param slices

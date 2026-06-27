@@ -10,7 +10,7 @@ homepage = "https://github.com/agene0001/dbkit-rs"
 documentation = "https://docs.rs/dbkit-rs"
 keywords = ["database", "sqlx", "duckdb", "datafusion", "arrow"]
 categories = ["database"]
-exclude = [".claude/"]
+exclude = [".claude/", "bench/"]
 
 [lib]
 name = "dbkit"
@@ -35,7 +35,7 @@ _arrow = ["dep:arrow"]
 _read-typed = ["dep:serde", "dep:serde_arrow", "serde_arrow/arrow-58", "_arrow"]
 
 [dependencies]
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "migrate"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "migrate", "tls-rustls"] }
 duckdb = { version = "1.10504", features = ["bundled", "vtab-arrow"], optional = true }
 dashmap = "6.2.1"
 tokio = { version = "1.52.3", features = ["rt"] }
