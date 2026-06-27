@@ -12,6 +12,13 @@ All notable changes to this project are documented here.
   25P02 ("current transaction is aborted") — one bad row sank the entire batch
   and masked the real error. Each row now gets a savepoint: a bad row rolls back
   to it (logging its *real* error) while the good rows still commit.
+- **`BatchParams` rows are now bound non-persistently** (`.persistent(false)`),
+  re-parsing per row instead of reusing one cached prepared statement across the
+  batch. Reuse pinned each parameter's type from the first row, so a first row
+  whose value was a typeless `NULL` (resolved by the server to the column type,
+  e.g. `int4`) made a later row's widened integer bind (`int8`) fail with 22P03
+  ("incorrect binary data format in bind parameter N"). Per-row parsing keeps
+  each row's parameter types self-consistent.
 
 ## [0.3.4]
 

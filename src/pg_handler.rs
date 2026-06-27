@@ -187,7 +187,14 @@ impl PgHandler {
                     sqlx::query(AssertSqlSafe("SAVEPOINT dbkit_row"))
                         .execute(&mut *tx)
                         .await?;
-                    let q = bind_pg(sqlx::query(AssertSqlSafe(query)), params);
+                    // `.persistent(false)` re-parses per row instead of reusing one
+                    // cached prepared statement across the batch. Reuse pins each
+                    // parameter's type from the FIRST row: a row whose value is a
+                    // typeless NULL lets the server resolve that param to the column
+                    // type (e.g. int4), and a later row binding the same column's
+                    // value as int8 then fails with 22P03 ("incorrect binary data
+                    // format"). Per-row parse keeps each row's param types self-consistent.
+                    let q = bind_pg(sqlx::query(AssertSqlSafe(query)), params).persistent(false);
                     match q.execute(&mut *tx).await {
                         Ok(_) => {
                             sqlx::query(AssertSqlSafe("RELEASE SAVEPOINT dbkit_row"))
