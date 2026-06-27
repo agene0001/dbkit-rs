@@ -25,6 +25,30 @@ use crate::analytical::RecordBatch;
 #[cfg(feature = "duckdb")]
 use crate::read::{ReadEngine, duckdb::DuckEngine};
 
+/// A typeless SQL `NULL`. Declares the Postgres parameter type as OID 0 so the
+/// server infers it from context — exactly like a bare `NULL` literal. This lets
+/// a `NULL` [`DbValue`] unify with any column type in `COALESCE` / `CASE` / etc.,
+/// instead of being pinned to one concrete type. (Binding `Option::<i64>::None`
+/// forced `int8`, which broke e.g. `COALESCE($1, external_id)` against a
+/// `varchar` column: "bigint and character varying cannot be matched".)
+struct PgNull;
+
+impl sqlx::Type<Postgres> for PgNull {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        // OID 0 → "unspecified", resolved from context by the server.
+        sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(0))
+    }
+}
+
+impl<'q> sqlx::Encode<'q, Postgres> for PgNull {
+    fn encode_by_ref(
+        &self,
+        _buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        Ok(sqlx::encode::IsNull::Yes)
+    }
+}
+
 /// Bind a slice of [`DbValue`]s onto a sqlx Postgres query, in order, binding
 /// the rich variants to their native Postgres types (no text fallback). Values
 /// are bound by owned copy, so the returned query does not borrow `params`.
@@ -34,7 +58,7 @@ fn bind_pg<'q>(
 ) -> Query<'q, Postgres, PgArguments> {
     for p in params {
         q = match p {
-            DbValue::Null => q.bind(Option::<i64>::None),
+            DbValue::Null => q.bind(PgNull),
             DbValue::Bool(b) => q.bind(*b),
             DbValue::Int(i) => q.bind(*i),
             DbValue::Float(f) => q.bind(*f),
