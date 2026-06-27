@@ -137,6 +137,8 @@ see "Migrating from 0.2" below.
 
 ### Migrating from 0.2
 
+See [MIGRATING.md](MIGRATING.md) for the full guide. In brief:
+
 - Imports change from `dbkit_rs::` to `dbkit::`.
 - Replace `&[&dyn ToSql]` params with `Vec<DbValue>` (`vec![x.into(), …]`).
 - Replace `ReadOp::Standard { map_fn, … }` with `execute_read_as::<T>`.

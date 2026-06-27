@@ -7,6 +7,8 @@ MySQL, or SQLite) is chosen by the connection URL scheme. Analytical reads go
 through a pluggable, Arrow-based engine (DuckDB or DataFusion) behind feature
 flags.
 
+> **Upgrading from 0.2?** See the [migration guide](MIGRATING.md).
+
 ## Features
 
 - **Multi-backend writes** — `ConnectionManager` + `BaseHandler` over sqlx; `postgres://`, `mysql://`, or `sqlite://` selects the backend
