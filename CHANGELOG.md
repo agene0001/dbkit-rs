@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.3]
+
+### Fixed
+
+- **`ConfigBuilder::build` now percent-encodes the user/password** when assembling
+  the connection URL from parts. A raw URL-reserved character in credentials
+  (e.g. `?`, `@`, `:`, `/`, `#`) previously corrupted the URL — notably a `?` in a
+  password truncated the authority so the password was parsed as the port,
+  yielding `error with configuration: invalid port number` and a failed
+  connect/auto-create. (The 0.2 deadpool path didn't build a URL, so this only
+  surfaced after the sqlx migration.)
+
+## [0.3.2]
+
+### Added
+
+- **`PgHandler::execute_read_as<T>`** — typed analytical read: runs a query on
+  the attached DuckDB engine and deserializes each row into `T` via `serde_arrow`
+  (column names must match `T`'s fields). The typed counterpart to
+  `PgHandler::execute_read`, mirroring `BaseHandler::execute_read_as`, so callers
+  can keep large scans / aggregations on DuckDB without hand-writing Arrow
+  column extraction.
+
 ## [0.3.1]
 
 Additive release (no breaking changes). Adds a native-Postgres, rich-typed

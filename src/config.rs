@@ -205,9 +205,14 @@ impl ConfigBuilder {
         let url = match self.backend {
             Backend::Sqlite => format!("sqlite://{}", self.database),
             backend => {
+                // Percent-encode credentials: a raw `?`, `@`, `:`, `/`, `#`, etc.
+                // in a user/password would otherwise corrupt the URL (e.g. a `?`
+                // truncates the authority, making the password look like a port).
+                use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+                let enc = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
                 let auth = match (&self.user, &self.password) {
-                    (Some(u), Some(p)) => format!("{}:{}@", u, p),
-                    (Some(u), None) => format!("{}@", u),
+                    (Some(u), Some(p)) => format!("{}:{}@", enc(u), enc(p)),
+                    (Some(u), None) => format!("{}@", enc(u)),
                     _ => String::new(),
                 };
 
@@ -278,6 +283,22 @@ mod tests {
     fn test_builder_minimal() {
         let config = DbkitConfig::builder().database("test").build();
         assert_eq!(config.url, "postgres://localhost:5432/test");
+    }
+
+    #[test]
+    fn test_builder_percent_encodes_credentials() {
+        // `?`/`!` in the password must be encoded or they corrupt the URL.
+        let config = DbkitConfig::builder()
+            .host("localhost")
+            .port(5432)
+            .user("postgres")
+            .password("LexLuthern246!!??")
+            .database("sports_ai_baseball")
+            .build();
+        assert_eq!(
+            config.url,
+            "postgres://postgres:LexLuthern246%21%21%3F%3F@localhost:5432/sports_ai_baseball"
+        );
     }
 
     #[test]
