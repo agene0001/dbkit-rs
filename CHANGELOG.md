@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.5]
+
+### Fixed
+
+- **`PgHandler` `WriteOp::BatchParams` now wraps each row in a SAVEPOINT.** The
+  batch runs in one transaction and skips failing rows, but on Postgres the first
+  row error aborts the whole transaction, so every subsequent row failed with
+  25P02 ("current transaction is aborted") — one bad row sank the entire batch
+  and masked the real error. Each row now gets a savepoint: a bad row rolls back
+  to it (logging its *real* error) while the good rows still commit.
+
 ## [0.3.4]
 
 ### Fixed

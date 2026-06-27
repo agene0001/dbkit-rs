@@ -179,10 +179,31 @@ impl PgHandler {
                 let mut tx = self.pool.begin().await?;
                 let mut failed = 0usize;
                 for (idx, params) in params_list.iter().enumerate() {
+                    // Wrap each row in a SAVEPOINT so a bad row rolls back on its
+                    // own instead of aborting the whole transaction. Without this,
+                    // Postgres marks the transaction failed on the first error and
+                    // every following row dies with 25P02 ("current transaction is
+                    // aborted"), turning one bad row into a whole failed batch.
+                    sqlx::query(AssertSqlSafe("SAVEPOINT dbkit_row"))
+                        .execute(&mut *tx)
+                        .await?;
                     let q = bind_pg(sqlx::query(AssertSqlSafe(query)), params);
-                    if let Err(e) = q.execute(&mut *tx).await {
-                        warn!("BatchParams row {}/{} failed: {:?}", idx + 1, total, e);
-                        failed += 1;
+                    match q.execute(&mut *tx).await {
+                        Ok(_) => {
+                            sqlx::query(AssertSqlSafe("RELEASE SAVEPOINT dbkit_row"))
+                                .execute(&mut *tx)
+                                .await?;
+                        }
+                        Err(e) => {
+                            warn!("BatchParams row {}/{} failed: {:?}", idx + 1, total, e);
+                            failed += 1;
+                            sqlx::query(AssertSqlSafe("ROLLBACK TO SAVEPOINT dbkit_row"))
+                                .execute(&mut *tx)
+                                .await?;
+                            sqlx::query(AssertSqlSafe("RELEASE SAVEPOINT dbkit_row"))
+                                .execute(&mut *tx)
+                                .await?;
+                        }
                     }
                 }
                 tx.commit().await?;
