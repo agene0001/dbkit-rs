@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.1]
+
+### Documentation
+
+- Build docs.rs with `all-features` so the optional APIs (`postgres-native`'s
+  `PgHandler` / `copy_in` / `copy_upsert`, the DuckDB/DataFusion read engines)
+  appear in the published documentation. No code changes.
+
 ## [0.4.0]
 
 ### Added

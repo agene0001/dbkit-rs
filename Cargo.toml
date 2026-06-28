@@ -1,6 +1,6 @@
 [package]
 name = "dbkit-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT" 
 description = "Multi-backend database infrastructure: sqlx writes (Postgres/MySQL/SQLite) with optional DuckDB/DataFusion analytical reads, pooling, caching, and migrations"
@@ -11,6 +11,12 @@ documentation = "https://docs.rs/dbkit-rs"
 keywords = ["database", "sqlx", "duckdb", "datafusion", "arrow"]
 categories = ["database"]
 exclude = [".claude/", "bench/"]
+
+# Build docs.rs with all features so the optional APIs (postgres-native's
+# PgHandler/copy_in/copy_upsert, the DuckDB/DataFusion read engines, etc.) are
+# visible in the published documentation.
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "dbkit"
