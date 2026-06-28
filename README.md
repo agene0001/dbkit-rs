@@ -15,6 +15,7 @@ flags.
 - **Connection pooling** — auto-create database, configurable pool size and timeouts
 - **Configurable** — `DbkitConfig` builder with URL construction, SSL modes, and pool tuning
 - **Unified writes** — `execute_write` with `WriteOp` (single / batch DDL / batch params) and neutral `DbValue` parameters
+- **Bulk Postgres writes** — `PgHandler::copy_in` (COPY) and `copy_upsert` (COPY → staging → set-based `ON CONFLICT`) for high-volume inserts/upserts
 - **Analytical reads** — `execute_read` returns `Vec<RecordBatch>` (Arrow); `execute_read_as::<T>` deserializes rows into typed structs via `serde_arrow`
 - **Pluggable read engines** — DuckDB or DataFusion (both may be enabled together; they share an Arrow version)
 - **Transactional → analytical sync** — `sync_tables()` / `sync_query()` copy data into the read engine (any backend × any engine); DuckDB can also attach Postgres live
@@ -84,7 +85,7 @@ Enable a read engine. DuckDB and DataFusion share the Arrow `RecordBatch`
 contract, so either can be used the same way:
 
 ```toml
-dbkit = { version = "0.3", features = ["duckdb"] }       # or "datafusion"
+dbkit = { version = "0.4", features = ["duckdb"] }       # or "datafusion"
 ```
 
 Attach a read engine to the handler:
@@ -145,7 +146,7 @@ decimal), enable `postgres-native` and drop to a real `PgPool` with full sqlx
 type support:
 
 ```toml
-dbkit = { version = "0.3", features = ["postgres-native"] }
+dbkit = { version = "0.4", features = ["postgres-native"] }
 ```
 
 ```rust
@@ -162,6 +163,62 @@ Use the `Any` pool (`handler.execute_write`) for portable work, and the native
 pool only where you need Postgres-specific types. (Other type features such as
 `rust_decimal` can be enabled by adding `sqlx` to your own `Cargo.toml` with the
 relevant feature — cargo unifies it with dbkit's.)
+
+### Bulk writes (Postgres)
+
+On a native `PgPool` (`postgres-native`), `PgHandler` offers three write paths.
+Pick by what the operation needs:
+
+| Use… | When |
+|------|------|
+| `copy_in` | Plain bulk **insert** into one table. Fastest (~30–50× row-by-row). All-or-nothing; no `ON CONFLICT`. |
+| `copy_upsert` | Bulk **upsert**: `COPY` → temp staging table → one set-based `INSERT…SELECT…ON CONFLICT` (~10× faster than row-by-row `ON CONFLICT`). |
+| `WriteOp::BatchParams` | Anything COPY can't do — see the four cases below. |
+
+```rust
+use dbkit::{DbValue, PgHandler, WriteOp};
+
+let pg = PgHandler::new(conn.pg_native_pool().await?);
+let rows = vec![
+    vec![DbValue::Int(1), DbValue::Text("a".into())],
+    vec![DbValue::Int(2), DbValue::Text("b".into())],
+];
+
+// Fastest plain bulk insert.
+pg.copy_in("items", &["id", "name"], &rows).await?;
+
+// Bulk upsert: overwrite `name` on id conflict. An empty update list ⇒ DO NOTHING.
+pg.copy_upsert("items", &["id", "name"], &["id"], &["name"], &rows).await?;
+
+// Row-by-row batch. `isolate_rows: false` = fast all-or-nothing;
+// `true` = wrap each row in a SAVEPOINT and skip bad rows.
+pg.execute_write(WriteOp::BatchParams {
+    query: "INSERT INTO items (id, name) VALUES ($1, $2) \
+            ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+    params_list: rows,
+    isolate_rows: false,
+}).await?;
+```
+
+`copy_upsert` is the default for bulk inserts/upserts into a Postgres table, but
+**`BatchParams` stays essential for four things COPY/staging genuinely can't do:**
+
+1. **Non-INSERT statements** — `BatchParams` runs *any* query per param set
+   (`UPDATE … WHERE`, `DELETE`, function calls, multi-CTE). Staging only does
+   insert-shaped loads.
+2. **Per-row error isolation** — `ON CONFLICT` only resolves unique/exclusion
+   conflicts; a CHECK/FK/NOT-NULL violation or bad value aborts the whole staged
+   `INSERT…SELECT`. `BatchParams { isolate_rows: true }` skips *any* bad row and
+   commits the rest.
+3. **Non-Postgres backends** — `copy_*` are Postgres-only; `BatchParams` runs on
+   the `Any` pool (MySQL/SQLite).
+4. **Small batches** — the temp-table + COPY + insert-select setup has fixed
+   overhead; for tens of rows, plain `BatchParams` (or a single multi-row INSERT)
+   wins.
+
+`copy_in` / `copy_upsert` are all-or-nothing and Postgres-only. Within one
+`copy_upsert` call the conflict key must be unique across `rows` (duplicate keys
+make `ON CONFLICT DO UPDATE` error — de-duplicate first).
 
 ### Name normalization
 

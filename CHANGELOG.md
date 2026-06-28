@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0]
+
+### Added
+
+- **`PgHandler::copy_upsert`** — bulk upsert via `COPY` into a temp staging table
+  then one set-based `INSERT … SELECT … ON CONFLICT`. Benchmarks ~10× faster than
+  row-by-row `BatchParams` with `ON CONFLICT` (and ~16× faster than the 0.2
+  equivalent). For the cases plain `copy_in` can't cover because `COPY` is not an
+  `INSERT` (no `ON CONFLICT`/`RETURNING`).
+
+### Performance
+
+- **`copy_in` render path** — pre-size the payload buffer, format integers/floats
+  directly into it (no per-cell `String`), and write `bytea` hex without per-byte
+  allocation. Shared with `copy_upsert` via a common renderer.
+
+### Changed (breaking)
+
+- **`WriteOp::BatchParams` gained an `isolate_rows: bool` field.** All call sites
+  must now set it. Use `isolate_rows: true` to keep 0.3.x behavior (per-row error
+  isolation: `PgHandler` wraps each row in a `SAVEPOINT` and skips bad rows; the
+  `Any` pool warns and continues).
+  - `isolate_rows: false` is a new **all-or-nothing** fast path: no per-row
+    savepoints, so the first error rolls back the whole batch, but it is ~2×
+    faster. On `PgHandler` it also reuses a single prepared statement
+    (`persistent(true)`) when the batch contains no typeless `NULL`s, falling back
+    to per-row parsing otherwise to avoid `22P03`. Use it for trusted bulk
+    inserts where partial success isn't needed; prefer `PgHandler::copy_in` for
+    the fastest plain bulk load.
+
 ## [0.3.5]
 
 ### Fixed

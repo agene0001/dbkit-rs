@@ -67,9 +67,12 @@ handler.execute_write(WriteOp::Single { query, params, mode }).await?;
 ```
 
 `WriteOp::Single` / `BatchDDL` / `BatchParams` are the same self-documenting enum
-as 0.2 — only the params type changed (`ToSql` → `DbValue`). `BatchParams` wraps
+as 0.2 — only the params type changed (`ToSql` → `DbValue`). `BatchParams` now
+takes an `isolate_rows: bool`: with `true` (the 0.2 behavior) `PgHandler` wraps
 each row in a `SAVEPOINT` and binds it non-persistently, so one failing row rolls
-back on its own instead of aborting (and silently sinking) the whole batch.
+back on its own instead of aborting (and silently sinking) the whole batch. With
+`false` the batch runs all-or-nothing without savepoints — ~2× faster, for
+trusted bulk inserts (prefer `PgHandler::copy_in` for the fastest plain load).
 
 ## Reads — this is what changed most
 

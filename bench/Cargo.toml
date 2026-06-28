@@ -12,4 +12,6 @@ publish = false
 dbkit_v2 = { package = "dbkit-rs", version = "=0.2.1" }
 dbkit_v3 = { package = "dbkit-rs", path = "..", features = ["postgres-native"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-tokio-postgres = "0.7" # to name `ToSql` for the v2 param slices
+tokio-postgres = "0.7" # to name `ToSql` for the v2 param slices + drive v2 COPY
+futures-util = "0.3"   # SinkExt / pin_mut! for the v2 COPY sink
+bytes = "1"            # COPY payload buffer (impl Buf) for the v2 sink

@@ -25,10 +25,29 @@ pub enum WriteOp<'a> {
     },
     /// Batch of DDL statements executed in a single transaction.
     BatchDDL { queries: &'a [&'a str] },
-    /// Same query executed for each parameter set in a transaction.
+    /// Same query executed once per parameter set, in a single transaction.
+    ///
+    /// Use for batched `INSERT … ON CONFLICT`, `UPDATE`s, or any non-Postgres
+    /// backend. For a plain high-volume insert into one table,
+    /// [`PgHandler::copy_in`](crate::PgHandler::copy_in) is ~30–50× faster — see
+    /// its docs for a full `copy_in`-vs-`BatchParams` decision guide.
     BatchParams {
         query: &'a str,
         params_list: Vec<Vec<DbValue>>,
+        /// Per-row error isolation.
+        ///
+        /// - `true` — a bad row is contained and the rest of the batch still
+        ///   commits. [`PgHandler`](crate::PgHandler) wraps each row in a
+        ///   `SAVEPOINT`; the multi-backend [`BaseHandler`] warns and continues
+        ///   (note: without savepoints a failed row aborts the Postgres
+        ///   transaction, so following rows fail too — real per-row isolation
+        ///   lives in `PgHandler`).
+        /// - `false` — **all-or-nothing**: no per-row savepoints, so the first
+        ///   error rolls back the whole batch. ~2× faster than the isolated
+        ///   path. Use for trusted bulk inserts where partial success isn't
+        ///   needed. For the fastest plain bulk load, prefer
+        ///   [`PgHandler::copy_in`](crate::PgHandler::copy_in).
+        isolate_rows: bool,
     },
 }
 
@@ -271,6 +290,7 @@ impl BaseHandler {
             WriteOp::BatchParams {
                 query,
                 params_list,
+                isolate_rows,
             } => {
                 if params_list.is_empty() {
                     return Ok(QueryResult::None);
@@ -278,8 +298,20 @@ impl BaseHandler {
 
                 let total = params_list.len();
                 let mut tx = self.pool.begin().await?;
-                let mut failed = 0usize;
 
+                if !isolate_rows {
+                    // All-or-nothing fast path: the first error aborts the whole
+                    // batch (propagated below). No per-row bookkeeping.
+                    for params in &params_list {
+                        bind_params(sqlx::query(AssertSqlSafe(query)), params)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    tx.commit().await?;
+                    return Ok(QueryResult::None);
+                }
+
+                let mut failed = 0usize;
                 for (idx, params) in params_list.iter().enumerate() {
                     // sqlx caches the prepared statement per query string on the
                     // connection, so re-issuing the same query reuses it.
