@@ -483,7 +483,16 @@ impl PgHandler {
         params: Vec<DbValue>,
         mode: FetchMode,
     ) -> Result<QueryResult<PgRow>, DbkitError> {
-        let q = bind_pg(sqlx::query(AssertSqlSafe(query)), &params);
+        // Statement reuse hazard: with the default `persistent(true)`, sqlx
+        // caches one prepared statement per (connection, SQL). A typeless NULL
+        // (`PgNull`, OID 0) lets the server pin that parameter's type from the
+        // FIRST execution, so a later call binding a concrete type for the same
+        // column fails with 22P03 ("incorrect binary data format"). Reuse the
+        // cached statement only when this call has no NULLs; otherwise re-parse
+        // so each call's param types stay self-consistent. (Same guard as the
+        // `BatchParams` write path.)
+        let has_null = params.iter().any(|v| matches!(v, DbValue::Null));
+        let q = bind_pg(sqlx::query(AssertSqlSafe(query)), &params).persistent(!has_null);
         match mode {
             FetchMode::None => {
                 q.execute(&self.pool).await?;

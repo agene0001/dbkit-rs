@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.2]
+
+### Fixed
+
+- **`PgHandler::query` (the `WriteOp::Single` path) no longer fails with 22P03
+  on reused statements containing NULLs.** With the default `persistent(true)`,
+  sqlx caches one prepared statement per `(connection, SQL)`; a typeless NULL
+  (`PgNull`, OID 0) lets the server pin a parameter's type from the first
+  execution, so a later call binding a concrete type for that same column failed
+  with `22P03` ("incorrect binary data format"). `query` now binds with
+  `persistent(false)` whenever a call contains a NULL (keeping caching for the
+  common no-NULL case) — the same NULL-aware guard the `BatchParams` write path
+  already uses. This silently broke order-dependent single-row upserts whose
+  columns flip NULL ⇄ concrete across calls (e.g. sportsbook odds inserts where
+  only some rows carry per-side odds).
+
 ## [0.4.1]
 
 ### Documentation
