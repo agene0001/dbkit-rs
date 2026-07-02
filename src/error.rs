@@ -60,4 +60,7 @@ pub enum DbkitError {
 
     #[error("migration failed: {0}")]
     Migration(String),
+
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }

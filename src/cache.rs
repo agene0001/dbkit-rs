@@ -62,6 +62,12 @@ where
 
     /// Set a value in a named bucket (creates the bucket if it doesn't exist).
     pub fn set(&self, bucket: &str, key: K, value: V) {
+        // Fast path: the bucket already exists (the steady state), so look it
+        // up by &str without allocating the owned String the entry API needs.
+        if let Some(b) = self.buckets.get(bucket) {
+            b.insert(key, value);
+            return;
+        }
         self.buckets
             .entry(bucket.to_string())
             .or_insert_with(|| Arc::new(DashMap::new()))

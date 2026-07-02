@@ -195,9 +195,8 @@ impl ConnectionManager {
         match backend {
             // sqlite://path/to/file.db  ->  path/to/file.db
             Backend::Sqlite => url
-                .splitn(2, ':')
-                .nth(1)
-                .unwrap_or("")
+                .split_once(':')
+                .map_or("", |(_, rest)| rest)
                 .trim_start_matches("//")
                 .split('?')
                 .next()

@@ -51,11 +51,13 @@ impl<'q> sqlx::Encode<'q, Postgres> for PgNull {
 }
 
 /// Bind a slice of [`DbValue`]s onto a sqlx Postgres query, in order, binding
-/// the rich variants to their native Postgres types (no text fallback). Values
-/// are bound by owned copy, so the returned query does not borrow `params`.
+/// the rich variants to their native Postgres types (no text fallback).
+/// Text/bytes/json/array values are bound by reference (sqlx encodes them into
+/// the argument buffer immediately), so no per-value clone is paid; the
+/// returned query borrows `params` for `'q`.
 fn bind_pg<'q>(
     mut q: Query<'q, Postgres, PgArguments>,
-    params: &[DbValue],
+    params: &'q [DbValue],
 ) -> Query<'q, Postgres, PgArguments> {
     for p in params {
         q = match p {
@@ -63,18 +65,18 @@ fn bind_pg<'q>(
             DbValue::Bool(b) => q.bind(*b),
             DbValue::Int(i) => q.bind(*i),
             DbValue::Float(f) => q.bind(*f),
-            DbValue::Text(s) => q.bind(s.clone()),
-            DbValue::Bytes(b) => q.bind(b.clone()),
+            DbValue::Text(s) => q.bind(s.as_str()),
+            DbValue::Bytes(b) => q.bind(b.as_slice()),
             DbValue::Date(d) => q.bind(*d),
             DbValue::DateTime(dt) => q.bind(*dt),
             DbValue::TimestampTz(dt) => q.bind(*dt),
-            DbValue::Json(j) => q.bind(j.clone()),
+            DbValue::Json(j) => q.bind(j),
             DbValue::Uuid(u) => q.bind(*u),
             DbValue::Time(t) => q.bind(*t),
             // sqlx binds `Vec<T>` / `Vec<Option<T>>` as native Postgres arrays.
-            DbValue::TextArray(v) => q.bind(v.clone()),
-            DbValue::FloatArray(v) => q.bind(v.clone()),
-            DbValue::OptFloatArray(v) => q.bind(v.clone()),
+            DbValue::TextArray(v) => q.bind(v),
+            DbValue::FloatArray(v) => q.bind(v),
+            DbValue::OptFloatArray(v) => q.bind(v),
         };
     }
     q
@@ -127,35 +129,66 @@ fn copy_render_cell(val: &DbValue, out: &mut String) {
     }
 }
 
-/// Render `rows` as a Postgres `COPY` text-format payload: cells tab-separated,
-/// one row per line. `ncols` is used only to pre-size the buffer.
-fn render_copy_text(rows: &[Vec<DbValue>], ncols: usize) -> String {
-    // Pre-size the buffer to avoid repeated grow-and-copy reallocations as it
-    // fills (~12 bytes/cell + tab/newline is a rough but useful estimate).
-    let mut payload = String::with_capacity(rows.len() * (ncols * 12 + 1));
+/// Flush threshold for streaming COPY payloads. Rendering is flushed to the
+/// sink whenever the buffer passes this size, so peak memory stays ~this bound
+/// regardless of row count, and rendering overlaps with network sends.
+const COPY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Render `rows` as Postgres `COPY` text format (cells tab-separated, one row
+/// per line) and stream them into an open COPY sink in ~[`COPY_CHUNK_BYTES`]
+/// chunks. `ncols` is used only to pre-size the buffer.
+async fn send_copy_rows<C>(
+    sink: &mut sqlx::postgres::PgCopyIn<C>,
+    rows: &[Vec<DbValue>],
+    ncols: usize,
+) -> Result<(), DbkitError>
+where
+    C: std::ops::DerefMut<Target = sqlx::postgres::PgConnection>,
+{
+    // Pre-size to the estimated payload (~12 bytes/cell + tab/newline), capped
+    // at one chunk — beyond that the buffer is flushed and reused anyway.
+    let estimate = rows.len() * (ncols * 12 + 1);
+    let mut buf = String::with_capacity(estimate.min(COPY_CHUNK_BYTES + 1024));
     for row in rows {
         for (i, val) in row.iter().enumerate() {
             if i > 0 {
-                payload.push('\t');
+                buf.push('\t');
             }
-            copy_render_cell(val, &mut payload);
+            copy_render_cell(val, &mut buf);
         }
-        payload.push('\n');
+        buf.push('\n');
+        if buf.len() >= COPY_CHUNK_BYTES {
+            sink.send(buf.as_bytes()).await?;
+            buf.clear();
+        }
     }
-    payload
+    if !buf.is_empty() {
+        sink.send(buf.as_bytes()).await?;
+    }
+    Ok(())
 }
 
 /// Escape a value for Postgres `COPY` text format (backslash, tab, newline, CR).
+///
+/// Scans for the next byte needing an escape and copies the clean span before
+/// it in one `push_str`; a string with no escapable bytes (the common case) is
+/// appended in a single copy. The four escape chars are ASCII, so byte
+/// positions are always UTF-8 boundaries.
 fn copy_escape_into(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
-        }
+    let mut start = 0;
+    for (i, b) in s.bytes().enumerate() {
+        let esc = match b {
+            b'\\' => "\\\\",
+            b'\t' => "\\t",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        out.push_str(&s[start..i]);
+        out.push_str(esc);
+        start = i + 1;
     }
+    out.push_str(&s[start..]);
 }
 
 /// Core query executor for native Postgres: rich-typed transactional writes via
@@ -266,18 +299,18 @@ impl PgHandler {
                     //
                     // Statement reuse: a typeless NULL (`PgNull`, OID 0) lets the
                     // server pin the cached statement's parameter type from the
-                    // FIRST row, so a later row binding a concrete type for that
-                    // same column fails with 22P03. So reuse one prepared
-                    // statement (`persistent(true)`) only when the batch has no
-                    // NULLs; otherwise re-parse per row to keep each row's param
-                    // types self-consistent (matching the isolated path).
-                    let has_null = params_list
-                        .iter()
-                        .any(|row| row.iter().any(|v| matches!(v, DbValue::Null)));
-                    let persistent = !has_null;
+                    // first *cached* row, so a later row binding a concrete type
+                    // for that same column fails with 22P03. Guard per ROW (not
+                    // per batch): rows with a NULL re-parse individually
+                    // (`persistent(false)`, letting the server infer that row's
+                    // NULL from context), while null-free rows — whose concrete
+                    // types are mutually consistent — keep reusing one cached
+                    // prepared statement. A batch that is 10% NULL rows keeps
+                    // statement reuse for the other 90%.
                     for params in &params_list {
+                        let has_null = params.iter().any(|v| matches!(v, DbValue::Null));
                         bind_pg(sqlx::query(AssertSqlSafe(query)), params)
-                            .persistent(persistent)
+                            .persistent(!has_null)
                             .execute(&mut *tx)
                             .await?;
                     }
@@ -381,10 +414,9 @@ impl PgHandler {
         }
 
         let stmt = format!("COPY {table} ({}) FROM STDIN", columns.join(", "));
-        let payload = render_copy_text(rows, columns.len());
 
         let mut sink = self.pool.copy_in_raw(&stmt).await?;
-        sink.send(payload.as_bytes()).await?;
+        send_copy_rows(&mut sink, rows, columns.len()).await?;
         Ok(sink.finish().await?)
     }
 
@@ -404,8 +436,9 @@ impl PgHandler {
     ///
     /// Returns the number of rows inserted or updated.
     ///
-    /// The staging table is `CREATE TEMP TABLE … (LIKE target INCLUDING DEFAULTS)
-    /// ON COMMIT DROP`, so it copies no constraints and vanishes at commit. The
+    /// The staging table is `CREATE TEMP TABLE … AS SELECT {columns} FROM target
+    /// WITH NO DATA` (`ON COMMIT DROP`) — target column types, no constraints or
+    /// defaults — and vanishes at commit. The
     /// final upsert is all-or-nothing: a non-conflict error (CHECK/FK/type) aborts
     /// the batch. **Within a single call, `conflict_columns` must be unique across
     /// `rows`** — duplicate keys make `ON CONFLICT DO UPDATE` error with "command
@@ -422,6 +455,13 @@ impl PgHandler {
     ) -> Result<u64, DbkitError> {
         if rows.is_empty() {
             return Ok(0);
+        }
+        if conflict_columns.is_empty() {
+            // Would render `ON CONFLICT () …` — a Postgres syntax error, but an
+            // opaque one; fail with a message that names the actual mistake.
+            return Err(DbkitError::InvalidArgument(
+                "copy_upsert: conflict_columns must not be empty".into(),
+            ));
         }
 
         let cols = columns.join(", ");
@@ -440,22 +480,30 @@ impl PgHandler {
 
         let mut tx = self.pool.begin().await?;
 
-        // 1. Staging table shaped like the target (no constraints), dropped at
-        //    COMMIT. Temp tables are connection-scoped, so the fixed name is safe
-        //    even under concurrent callers on separate connections.
+        // 1. Staging table with ONLY the copied columns (target types, no
+        //    constraints, no defaults), dropped at COMMIT. Temp tables are
+        //    connection-scoped, so the fixed name is safe even under concurrent
+        //    callers on separate connections.
+        //
+        //    `AS SELECT … WITH NO DATA` rather than `LIKE {table}`: LIKE always
+        //    copies NOT NULL constraints (so unlisted NOT-NULL columns would
+        //    reject COPY's NULL fill), and `INCLUDING DEFAULTS` — used before
+        //    0.5 to paper over that — made COPY fire a copied serial default,
+        //    burning one target-sequence value per staged row for nothing.
+        //    Narrowing staging to the listed columns sidesteps both; the
+        //    target's own defaults still apply at the INSERT below.
         sqlx::query(AssertSqlSafe(format!(
-            "CREATE TEMP TABLE {stage} (LIKE {table} INCLUDING DEFAULTS) ON COMMIT DROP"
+            "CREATE TEMP TABLE {stage} ON COMMIT DROP AS SELECT {cols} FROM {table} WITH NO DATA"
         )))
         .execute(&mut *tx)
         .await?;
 
         // 2. Bulk-load into staging via COPY on the SAME connection (so the temp
         //    table is visible) — this is where the throughput comes from.
-        let payload = render_copy_text(rows, columns.len());
-        let mut copy = (&mut *tx)
+        let mut copy = (*tx)
             .copy_in_raw(&format!("COPY {stage} ({cols}) FROM STDIN"))
             .await?;
-        copy.send(payload.as_bytes()).await?;
+        send_copy_rows(&mut copy, rows, columns.len()).await?;
         copy.finish().await?;
 
         // 3. One set-based upsert from staging into the target.
@@ -540,5 +588,28 @@ impl PgHandler {
     {
         let batches = self.execute_read(sql, params).await?;
         crate::analytical::deserialize_batches(&batches)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn esc(s: &str) -> String {
+        let mut out = String::new();
+        copy_escape_into(s, &mut out);
+        out
+    }
+
+    #[test]
+    fn copy_escape_clean_passthrough_and_escapes() {
+        assert_eq!(esc(""), "");
+        assert_eq!(esc("plain text é ✓ 日本"), "plain text é ✓ 日本");
+        assert_eq!(esc("a\tb"), "a\\tb");
+        assert_eq!(esc("\\"), "\\\\");
+        assert_eq!(esc("\n\r\t"), "\\n\\r\\t");
+        assert_eq!(esc("trailing\\"), "trailing\\\\");
+        assert_eq!(esc("\\leading"), "\\\\leading");
+        assert_eq!(esc("mixé\tmulti✓\nbyte"), "mixé\\tmulti✓\\nbyte");
     }
 }

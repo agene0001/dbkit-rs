@@ -85,4 +85,12 @@ impl ReadEngine for DataFusionEngine {
             .map_err(|e| DbkitError::DataFusion(e.to_string()))?;
         Ok(())
     }
+
+    async fn drop_table(&self, name: &str) -> Result<(), DbkitError> {
+        // Deregistering a name that was never registered returns Ok(None).
+        self.ctx
+            .deregister_table(name)
+            .map_err(|e| DbkitError::DataFusion(e.to_string()))?;
+        Ok(())
+    }
 }

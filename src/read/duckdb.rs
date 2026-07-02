@@ -47,11 +47,11 @@ impl DuckEngine {
             .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
         conn.execute_batch("INSTALL postgres; LOAD postgres;")
             .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
-        conn.execute(
-            &format!("ATTACH '{connection_string}' AS pg (TYPE POSTGRES)"),
-            [],
-        )
-        .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
+        // Escape embedded single quotes (common in passwords) so the
+        // connection string can't break out of the ATTACH literal.
+        let escaped = connection_string.replace('\'', "''");
+        conn.execute(&format!("ATTACH '{escaped}' AS pg (TYPE POSTGRES)"), [])
+            .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
         Ok(())
     }
 
@@ -64,14 +64,24 @@ impl ReadEngine for DuckEngine {
         sql: &str,
         params: &[DbValue],
     ) -> Result<Vec<RecordBatch>, DbkitError> {
-        let conn = self.conn.clone();
+        // Run each query on its own cloned connection handle: `try_clone` is a
+        // cheap second connection to the SAME DuckDB instance (shared catalog,
+        // including synced tables and ATTACHed databases), so concurrent reads
+        // execute in parallel instead of serializing behind the root
+        // connection's Mutex. The lock is held only for the clone itself.
+        let conn = {
+            let guard = self
+                .conn
+                .lock()
+                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
+            guard
+                .try_clone()
+                .map_err(|e| DbkitError::DuckDb(e.to_string()))?
+        };
         let sql = sql.to_string();
         let params = params.to_vec();
 
         task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
@@ -111,10 +121,11 @@ impl ReadEngine for DuckEngine {
             for (i, batch) in batches.into_iter().enumerate() {
                 // The first batch creates (or replaces) the table; the rest
                 // append. DuckDB infers the schema from the Arrow data.
+                let quoted = quote_ident(&name);
                 let sql = if i == 0 {
-                    format!("CREATE OR REPLACE TABLE \"{name}\" AS SELECT * FROM arrow(?, ?)")
+                    format!("CREATE OR REPLACE TABLE {quoted} AS SELECT * FROM arrow(?, ?)")
                 } else {
-                    format!("INSERT INTO \"{name}\" SELECT * FROM arrow(?, ?)")
+                    format!("INSERT INTO {quoted} SELECT * FROM arrow(?, ?)")
                 };
                 let params = arrow_recordbatch_to_query_params(batch);
                 conn.execute(&sql, params)
@@ -124,6 +135,66 @@ impl ReadEngine for DuckEngine {
         })
         .await
         .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
+    }
+
+    async fn drop_table(&self, name: &str) -> Result<(), DbkitError> {
+        let conn = self.conn.clone();
+        let name = name.to_string();
+
+        task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
+            conn.execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(&name)), [])
+                .map_err(|e| DbkitError::DuckDb(format!("drop_table {name}: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| DbkitError::TaskJoin(e.to_string()))?
+    }
+}
+
+/// Double-quote an identifier for DuckDB, escaping embedded quotes.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analytical::arrow::array::Int64Array;
+
+    /// `query_arrow` runs on a `try_clone`d connection — prove the clone shares
+    /// the root connection's catalog (tables created via the root are visible),
+    /// and that `drop_table` really removes them.
+    #[tokio::test]
+    async fn cloned_connection_shares_catalog_and_drop_table_works() {
+        let eng = DuckEngine::new_in_memory().unwrap();
+        {
+            let conn = eng.conn.lock().unwrap();
+            conn.execute_batch("CREATE TABLE t AS SELECT * FROM range(5) r(a)")
+                .unwrap();
+        }
+
+        let batches = eng
+            .query_arrow("SELECT count(*) AS n FROM t WHERE a >= ?", &[DbValue::Int(1)])
+            .await
+            .expect("clone sees root's table");
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 4);
+
+        eng.drop_table("t").await.unwrap();
+        assert!(
+            eng.query_arrow("SELECT * FROM t", &[]).await.is_err(),
+            "table gone after drop_table"
+        );
+        // Dropping a never-loaded table is a no-op, not an error.
+        eng.drop_table("never_loaded").await.unwrap();
     }
 }
 

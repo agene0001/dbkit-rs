@@ -37,11 +37,10 @@ pub enum WriteOp<'a> {
         /// Per-row error isolation.
         ///
         /// - `true` — a bad row is contained and the rest of the batch still
-        ///   commits. [`PgHandler`](crate::PgHandler) wraps each row in a
-        ///   `SAVEPOINT`; the multi-backend [`BaseHandler`] warns and continues
-        ///   (note: without savepoints a failed row aborts the Postgres
-        ///   transaction, so following rows fail too — real per-row isolation
-        ///   lives in `PgHandler`).
+        ///   commits. Both [`PgHandler`](crate::PgHandler) and the
+        ///   multi-backend [`BaseHandler`] wrap each row in a `SAVEPOINT`
+        ///   (standard SQL: Postgres, MySQL/InnoDB, SQLite), so a failed row
+        ///   rolls back alone instead of aborting the transaction.
         /// - `false` — **all-or-nothing**: no per-row savepoints, so the first
         ///   error rolls back the whole batch. ~2× faster than the isolated
         ///   path. Use for trusted bulk inserts where partial success isn't
@@ -120,7 +119,16 @@ fn bind_params<'q>(
 ) -> Query<'q, Any, AnyArguments> {
     for p in params {
         q = match p {
-            DbValue::Null => q.bind(Option::<i64>::None),
+            // A text-typed NULL, matching the text fallback used for the rich
+            // variants below, so a nullable column behaves the same whether a
+            // given row's value is NULL or not. (Binding `Option::<i64>::None`
+            // — as dbkit < 0.5 did — declared the parameter as `int8` on
+            // Postgres, so NULLs into varchar/date/json columns failed with
+            // "column is of type X but expression is of type bigint".) For
+            // non-text Postgres columns, cast explicitly in SQL (`$1::date`) —
+            // the same rule as the rich-type text fallback. For native typed
+            // NULL inference use `PgHandler`.
+            DbValue::Null => q.bind(Option::<String>::None),
             DbValue::Bool(b) => q.bind(*b),
             DbValue::Int(i) => q.bind(*i),
             DbValue::Float(f) => q.bind(*f),
@@ -257,7 +265,16 @@ impl BaseHandler {
                 params,
                 mode,
             } => {
-                let q = bind_params(sqlx::query(AssertSqlSafe(query)), &params);
+                // Statement-reuse guard (same as PgHandler): sqlx caches one
+                // prepared statement per (connection, SQL), pinning parameter
+                // types from the first execution. A NULL here binds as text,
+                // so a call whose NULL/concrete pattern differs from the
+                // cached statement's types would fail (22P03 / type mismatch)
+                // on Postgres. Re-parse NULL-bearing calls; keep caching for
+                // the common no-NULL case.
+                let has_null = params.iter().any(|v| matches!(v, DbValue::Null));
+                let q = bind_params(sqlx::query(AssertSqlSafe(query)), &params)
+                    .persistent(!has_null);
                 match mode {
                     FetchMode::None => {
                         q.execute(&self.pool).await?;
@@ -302,8 +319,14 @@ impl BaseHandler {
                 if !isolate_rows {
                     // All-or-nothing fast path: the first error aborts the whole
                     // batch (propagated below). No per-row bookkeeping.
+                    //
+                    // Statement reuse: re-parse NULL-bearing rows so their param
+                    // types don't collide with the cached statement's pinned
+                    // types (NULL binds as text; see `bind_params`).
                     for params in &params_list {
+                        let has_null = params.iter().any(|v| matches!(v, DbValue::Null));
                         bind_params(sqlx::query(AssertSqlSafe(query)), params)
+                            .persistent(!has_null)
                             .execute(&mut *tx)
                             .await?;
                     }
@@ -313,12 +336,36 @@ impl BaseHandler {
 
                 let mut failed = 0usize;
                 for (idx, params) in params_list.iter().enumerate() {
-                    // sqlx caches the prepared statement per query string on the
-                    // connection, so re-issuing the same query reuses it.
-                    let q = bind_params(sqlx::query(AssertSqlSafe(query)), params);
-                    if let Err(e) = q.execute(&mut *tx).await {
-                        warn!("BatchParams row {}/{} failed: {:?}", idx + 1, total, e);
-                        failed += 1;
+                    // Wrap each row in a SAVEPOINT (standard SQL — Postgres,
+                    // MySQL/InnoDB, and SQLite all support it) so a bad row
+                    // rolls back on its own instead of poisoning the batch.
+                    // Postgres in particular marks the whole transaction failed
+                    // on the first error without this: every following row died
+                    // with 25P02 and the final COMMIT silently became ROLLBACK,
+                    // so one bad row used to lose the entire batch (dbkit < 0.5)
+                    // while still returning Ok.
+                    sqlx::query(AssertSqlSafe("SAVEPOINT dbkit_row"))
+                        .execute(&mut *tx)
+                        .await?;
+                    let has_null = params.iter().any(|v| matches!(v, DbValue::Null));
+                    let q = bind_params(sqlx::query(AssertSqlSafe(query)), params)
+                        .persistent(!has_null);
+                    match q.execute(&mut *tx).await {
+                        Ok(_) => {
+                            sqlx::query(AssertSqlSafe("RELEASE SAVEPOINT dbkit_row"))
+                                .execute(&mut *tx)
+                                .await?;
+                        }
+                        Err(e) => {
+                            warn!("BatchParams row {}/{} failed: {:?}", idx + 1, total, e);
+                            failed += 1;
+                            sqlx::query(AssertSqlSafe("ROLLBACK TO SAVEPOINT dbkit_row"))
+                                .execute(&mut *tx)
+                                .await?;
+                            sqlx::query(AssertSqlSafe("RELEASE SAVEPOINT dbkit_row"))
+                                .execute(&mut *tx)
+                                .await?;
+                        }
                     }
                 }
 
@@ -390,6 +437,11 @@ impl BaseHandler {
     /// This is the engine-agnostic replacement for the old DuckDB `ATTACH`
     /// sync: rows are fetched over sqlx, converted to Arrow, and handed to the
     /// active read engine. Works for any backend × engine combination.
+    ///
+    /// An **empty result drops the analytical table** (the schema can't be
+    /// inferred from zero rows): reads of a table synced empty error with
+    /// "table not found" rather than silently serving rows from a previous
+    /// sync.
     #[cfg(any(feature = "duckdb", feature = "datafusion"))]
     pub async fn sync_query(
         &self,
@@ -402,8 +454,9 @@ impl BaseHandler {
         let q = bind_params(sqlx::query(AssertSqlSafe(query.to_string())), params);
         let rows = q.fetch_all(&self.pool).await?;
 
-        if let Some(batch) = crate::read::rows_to_record_batch(&rows)? {
-            engine.load_table(name, vec![batch]).await?;
+        match crate::read::rows_to_record_batch(&rows)? {
+            Some(batch) => engine.load_table(name, vec![batch]).await?,
+            None => engine.drop_table(name).await?,
         }
         Ok(())
     }
