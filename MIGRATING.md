@@ -1,3 +1,28 @@
+# Migrating between dbkit versions
+
+## 0.4 → 0.5 (quick checklist)
+
+0.5 is a correctness release; most code compiles unchanged. Check these four:
+
+1. **Custom `ReadEngine` implementations** must add the new `drop_table`
+   method (the built-in DuckDB/DataFusion engines already have it).
+2. **Exhaustive `match` on `DbkitError`** needs an arm for the new
+   `InvalidArgument` variant.
+3. **`Any`-pool NULLs are now text-typed.** A bare `DbValue::Null` bound into
+   a *non-text* Postgres column now needs an explicit cast in the SQL
+   (`$1::bigint`) — the same rule that already applied to the rich-type text
+   fallback. (`PgHandler` is unaffected; its `NULL` stays typeless.) In
+   exchange, NULLs into text/varchar columns — which previously *failed* —
+   now work.
+4. **`ConfigBuilder` URLs always carry an explicit ssl parameter** now, and
+   MySQL gets the spelling sqlx-mysql actually parses. If you depended on
+   `SslMode::Disable` (the default) silently behaving as the driver default
+   (*prefer*), set `SslMode::Prefer` explicitly.
+
+Also note: migration hashes recorded by 0.4 and earlier are upgraded in place
+the first time `run_named_migration` sees the same content again — no action
+needed, but don't hand-edit `_dbkit_migrations`.
+
 # Migrating from dbkit 0.2 to 0.3
 
 ## The one-sentence shift

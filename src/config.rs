@@ -109,7 +109,13 @@ pub struct ConfigBuilder {
     ssl_mode: SslMode,
 }
 
-/// SSL mode for Postgres connections.
+/// SSL mode for server backends (Postgres / MySQL).
+///
+/// [`ConfigBuilder::build`] renders this as the backend's own URL parameter —
+/// `sslmode=disable|prefer|require` for Postgres, `ssl-mode=DISABLED|PREFERRED|
+/// REQUIRED` for MySQL — so the built URL parses on either driver. The mode is
+/// always written explicitly (including the default `Disable`), because the
+/// drivers' own defaults differ from it (sqlx defaults to *prefer*).
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SslMode {
     /// No SSL (default — matches current NoTls behavior).
@@ -218,10 +224,18 @@ impl ConfigBuilder {
 
                 let port = self.port.unwrap_or_else(|| backend.default_port());
 
-                let ssl_param = match self.ssl_mode {
-                    SslMode::Disable => "",
-                    SslMode::Prefer => "?sslmode=prefer",
-                    SslMode::Require => "?sslmode=require",
+                // Each driver validates its own parameter: sqlx-postgres wants
+                // `sslmode=disable|prefer|require`, sqlx-mysql wants
+                // `ssl-mode=DISABLED|PREFERRED|REQUIRED` (it rejects the
+                // Postgres spellings at connect time). Always written out,
+                // since the drivers default to *prefer*, not `Disable`.
+                let ssl_param = match (backend, self.ssl_mode) {
+                    (Backend::MySql, SslMode::Disable) => "?ssl-mode=DISABLED",
+                    (Backend::MySql, SslMode::Prefer) => "?ssl-mode=PREFERRED",
+                    (Backend::MySql, SslMode::Require) => "?ssl-mode=REQUIRED",
+                    (_, SslMode::Disable) => "?sslmode=disable",
+                    (_, SslMode::Prefer) => "?sslmode=prefer",
+                    (_, SslMode::Require) => "?sslmode=require",
                 };
 
                 format!(
@@ -282,7 +296,7 @@ mod tests {
     #[test]
     fn test_builder_minimal() {
         let config = DbkitConfig::builder().database("test").build();
-        assert_eq!(config.url, "postgres://localhost:5432/test");
+        assert_eq!(config.url, "postgres://localhost:5432/test?sslmode=disable");
     }
 
     #[test]
@@ -297,7 +311,7 @@ mod tests {
             .build();
         assert_eq!(
             config.url,
-            "postgres://postgres:LexLuthern246%21%21%3F%3F@localhost:5432/sports_ai_baseball"
+            "postgres://postgres:LexLuthern246%21%21%3F%3F@localhost:5432/sports_ai_baseball?sslmode=disable"
         );
     }
 
@@ -307,7 +321,7 @@ mod tests {
             .user("readonly")
             .database("prod")
             .build();
-        assert_eq!(config.url, "postgres://readonly@localhost:5432/prod");
+        assert_eq!(config.url, "postgres://readonly@localhost:5432/prod?sslmode=disable");
     }
 
     #[test]
@@ -317,7 +331,19 @@ mod tests {
             .user("root")
             .database("app")
             .build();
-        assert_eq!(config.url, "mysql://root@localhost:3306/app");
+        assert_eq!(config.url, "mysql://root@localhost:3306/app?ssl-mode=DISABLED");
+    }
+
+    #[test]
+    fn test_builder_mysql_ssl_mode_spelling() {
+        // sqlx-mysql rejects the Postgres spellings (`sslmode=require`) at
+        // connect time; MySQL URLs must use `ssl-mode=REQUIRED` etc.
+        let config = DbkitConfig::builder()
+            .backend(Backend::MySql)
+            .database("app")
+            .ssl_mode(SslMode::Require)
+            .build();
+        assert_eq!(config.url, "mysql://localhost:3306/app?ssl-mode=REQUIRED");
     }
 
     #[test]

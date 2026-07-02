@@ -2,6 +2,105 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0]
+
+A correctness-and-performance release: four bug fixes that could bite silently
+in production, several semantic hardening changes, and measured speedups on the
+COPY render path. Behavior changes are called out below.
+
+### Fixed
+
+- **`ConfigBuilder::ssl_mode` with `Backend::MySql` produced a URL sqlx rejects
+  at connect time.** The builder wrote the Postgres spelling
+  (`?sslmode=prefer|require`), but sqlx-mysql only accepts
+  `ssl-mode=DISABLED|PREFERRED|REQUIRED` — every MySQL connection with a
+  non-default `ssl_mode` failed with a configuration error. The parameter is
+  now rendered per backend.
+- **Migration hashes are now a stable FNV-1a 64** instead of std's
+  `DefaultHasher`, whose algorithm is explicitly not guaranteed across Rust
+  releases — a toolchain upgrade could have made every already-applied
+  migration error with "content has changed". Rows recorded by older dbkit
+  versions are recognized via the legacy hash and upgraded in place on the next
+  `run_named_migration` with unchanged content.
+- **`DbValue::Null` on the `Any` pool binds as a *text* NULL** (was
+  `Option::<i64>::None`, i.e. an `int8`-typed NULL on Postgres, so a NULL into
+  a varchar/text column failed with "column is of type X but expression is of
+  type bigint"). Text matches the `Any` path's existing text-fallback strategy
+  for rich types: NULL and non-NULL rows now behave the same for a given
+  column. **Behavior change:** a bare NULL into a *non-text* Postgres column
+  now needs an explicit cast in SQL (`$1::bigint`), the same rule as the
+  rich-type text fallback; use `PgHandler` for typeless NULL inference.
+  NULL-bearing statements also re-parse (`persistent(false)`) so they can't
+  poison the cached prepared statement's parameter types — the same 22P03
+  guard `PgHandler` gained in 0.4.2.
+- **`BaseHandler` `BatchParams { isolate_rows: true }` no longer silently loses
+  the whole batch on Postgres.** Without savepoints, the first bad row aborted
+  the transaction, every later row failed with 25P02, and the final `COMMIT`
+  was silently converted to `ROLLBACK` — zero rows committed, yet the call
+  returned `Ok`. The multi-backend path now wraps each row in a `SAVEPOINT`
+  (standard SQL: Postgres, MySQL/InnoDB, SQLite), giving real per-row
+  isolation, matching `PgHandler`.
+- **`sync_query` / `sync_tables` of an empty result no longer leaves the
+  previously synced table serving stale rows.** Zero rows now *drop* the
+  analytical table (the schema can't be inferred from an empty `Any` result
+  set), so reads fail with "table not found" instead of silently returning old
+  data.
+- **`copy_upsert` staging no longer burns target sequences.** The staging table
+  is now `CREATE TEMP TABLE … AS SELECT {columns} FROM target WITH NO DATA`
+  (only the copied columns, no constraints, no defaults) instead of
+  `LIKE target INCLUDING DEFAULTS`, which made COPY fire a copied
+  serial/`nextval()` default once per staged row.
+- **`DuckEngine::attach_postgres` escapes single quotes in the connection
+  string** (common in passwords), which previously broke out of the `ATTACH`
+  literal. Table names in `load_table` are likewise quote-escaped.
+- **`copy_upsert` with empty `conflict_columns`** now fails up front with
+  `DbkitError::InvalidArgument` instead of an opaque Postgres syntax error.
+
+### Performance
+
+Measured against local Postgres 18 with `bench/` (end-to-end, median of 3
+runs, interleaved old/new binaries) and `bench/src/bin/micro.rs` (client-side
+CPU cost in isolation, no network):
+
+- **COPY text rendering** — `copy_escape_into` copies clean spans in bulk
+  instead of pushing char-by-char; a cell with no escapable bytes (the common
+  case) is one `push_str`. Isolated: **2.2× faster** on clean cells
+  (17.0 → 7.6 ns/cell), neutral (1.00×) on escape-heavy cells. End-to-end
+  COPY throughput is network/server-bound at these cell sizes (~0.5M rows/s
+  for 200k rows), so wall-clock is unchanged — this buys CPU headroom, not
+  latency.
+- **COPY payloads stream in ~4 MiB chunks** instead of materializing the whole
+  payload: peak memory is bounded regardless of row count (a 10M-row load no
+  longer holds the entire rendered payload in RAM), and rendering overlaps
+  with the network sends. Same end-to-end throughput at bench sizes.
+- **`PgHandler` binds text/bytes/json/array parameters by reference** — no
+  per-value clone per row. Isolated bind cost drops **17%**
+  (353 → 292 ns/row for a 3-column row); `BatchParams` end-to-end is
+  round-trip-bound, so this is CPU headroom under concurrency.
+- **Per-row statement-reuse granularity in the `BatchParams` fast path**: only
+  rows that actually contain a NULL re-parse; null-free rows keep reusing the
+  cached prepared statement (was: one NULL anywhere disabled reuse for the
+  whole batch). The per-row scan costs ~0.4 ns/row.
+- **DuckDB reads no longer serialize behind one Mutex** — each `query_arrow`
+  runs on a cheap `try_clone`d connection to the same instance (shared
+  catalog), so concurrent analytical reads execute in parallel.
+- **`Cache::set` no longer allocates** a `String` for the bucket name when the
+  bucket already exists (the steady state).
+
+### Changed (breaking)
+
+- **`ReadEngine` gained a required `drop_table` method** (used by the
+  empty-sync fix). External implementors must add it; the built-in DuckDB and
+  DataFusion engines are updated.
+- **`DbkitError` gained the `InvalidArgument` variant** (exhaustive matches
+  need a new arm).
+- **`ConfigBuilder::build` always writes the ssl parameter explicitly**,
+  including the default `SslMode::Disable` (`?sslmode=disable` /
+  `?ssl-mode=DISABLED`). Previously `Disable` wrote nothing, which silently
+  fell back to the sqlx driver default — *prefer*, not disable — contradicting
+  the documented "No SSL" semantics. If you relied on the accidental
+  prefer-TLS behavior, set `SslMode::Prefer` explicitly.
+
 ## [0.4.2]
 
 ### Fixed

@@ -42,5 +42,9 @@ pub trait ReadEngine: Send + Sync {
         name: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<(), DbkitError>;
+
+    /// Drop the named in-memory table if it exists. Dropping a table that was
+    /// never loaded is a no-op, not an error.
+    async fn drop_table(&self, name: &str) -> Result<(), DbkitError>;
 }
 

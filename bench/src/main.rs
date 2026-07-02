@@ -41,6 +41,9 @@ const N_SINGLE: usize = 2_000;
 const N_CONC: usize = 2_000;
 const WORKERS: usize = 16; // matches the default pool size
 const N_BULK: usize = 20_000;
+/// Larger COPY payload so the text-render path carries measurable weight
+/// relative to the network round-trip.
+const N_COPY_BIG: usize = 200_000;
 const N_SELECT: usize = 2_000;
 const RUNS: usize = 3;
 /// NULL fractions (percent of `val` set NULL) to sweep in the batch-with-NULLs test.
@@ -456,6 +459,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             durs.push(start.elapsed());
         }
         report("v3 COPY (PgHandler)", "rows", N_BULK, &mut durs);
+    }
+
+    // ========================================================================
+    // 4c. bulk INSERT, COPY — large payload, clean vs escape-heavy text.
+    //     At 200k rows the render path (escaping + buffer writes) is a visible
+    //     fraction of the total; "clean" text has no COPY escape chars (the
+    //     common case), "escapes" forces the per-char escape path on every cell.
+    // ========================================================================
+    println!("\n== bulk INSERT, COPY large ({N_COPY_BIG} rows) — render-path weight ==");
+
+    let big_clean: Vec<Vec<DbValue>> = (0..N_COPY_BIG)
+        .map(|i| {
+            let (id, name, val) = row_data(i);
+            vec![id.into(), name.into(), val.into()]
+        })
+        .collect();
+    let big_esc: Vec<Vec<DbValue>> = (0..N_COPY_BIG)
+        .map(|i| {
+            let (id, _, val) = row_data(i);
+            vec![id.into(), format!("it\tem\n{i}\\pad-{i}").into(), val.into()]
+        })
+        .collect();
+
+    for (label, rows) in [
+        ("v3 COPY 200k clean text", &big_clean),
+        ("v3 COPY 200k escape-heavy", &big_esc),
+    ] {
+        truncate().await;
+        let _ = pg.copy_in("bench_items", &["id", "name", "val"], rows).await?; // warmup
+        let mut durs = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            truncate().await;
+            let start = Instant::now();
+            let n = pg.copy_in("bench_items", &["id", "name", "val"], rows).await?;
+            assert_eq!(n as usize, N_COPY_BIG);
+            durs.push(start.elapsed());
+        }
+        report(label, "rows", N_COPY_BIG, &mut durs);
     }
 
     // ========================================================================

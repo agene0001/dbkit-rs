@@ -3,6 +3,9 @@ name = "dbkit-bench"
 version = "0.0.0"
 edition = "2021"
 publish = false
+# `cargo run --release` runs the end-to-end bench; the client-side micro-bench
+# is `cargo run --release --bin micro`.
+default-run = "dbkit-bench"
 
 # Own workspace root so cargo doesn't treat this as part of the parent crate.
 [workspace]
@@ -15,3 +18,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7" # to name `ToSql` for the v2 param slices + drive v2 COPY
 futures-util = "0.3"   # SinkExt / pin_mut! for the v2 COPY sink
 bytes = "1"            # COPY payload buffer (impl Buf) for the v2 sink
+# For the no-network micro-bench (src/bin/micro.rs): bind-path cost isolation.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
