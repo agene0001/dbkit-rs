@@ -251,9 +251,16 @@ impl PgHandler {
         &self.pool
     }
 
-    /// Unicode NFD normalization — decomposes characters then lowercases.
+    /// Accent-insensitive name key: NFD-decompose, DROP combining marks, then
+    /// lowercase — "José Ramírez" and "Jose Ramirez" produce the same key.
+    /// See `BaseHandler::normalize_name` for the rationale (NFD alone leaves
+    /// combining marks, so accented names never matched stripped variants).
     pub fn normalize_name(name: &str) -> String {
-        name.nfd().collect::<String>().to_lowercase()
+        use unicode_normalization::char::is_combining_mark;
+        name.nfd()
+            .filter(|c| !is_combining_mark(*c))
+            .collect::<String>()
+            .to_lowercase()
     }
 
     // ==================== UNIFIED WRITE ====================

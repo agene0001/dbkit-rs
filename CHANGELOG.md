@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.1]
+
+### Fixed
+
+- **`normalize_name` is now genuinely accent-insensitive.** It NFD-decomposed
+  and lowercased but kept the combining marks, so it only equalized composed
+  vs decomposed representations of the *same* accented string — "José Ramírez"
+  never matched "Jose Ramirez", despite the function's documented purpose.
+  Since US data feeds routinely strip diacritics while league-official sources
+  keep them, name-keyed matching missed on every accented name (verified
+  downstream: 25+ split player identities, and name-only lookups failing for
+  accent-stripped inputs). Combining marks are now dropped after decomposition
+  (NFD → strip marks → lowercase), in both `BaseHandler` and `PgHandler`.
+  Callers persisting normalized keys should regenerate them, since the key for
+  accented names changes.
+
 ## [0.5.0]
 
 A correctness-and-performance release: four bug fixes that could bite silently

@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Read(//c/Users/Felix/.cargo/registry/src/**)",
+      "Bash(tokei ~/OneDrive/Desktop/cs_projects/dbkit-rs/src)",
+      "Bash(fd -e rs . ~/OneDrive/Desktop/cs_projects/dbkit-rs/src ~/OneDrive/Desktop/cs_projects/dbkit-rs/tests -x wc -l {})",
+      "Bash(ls ~/.cargo/registry/src/*/ | grep -E \"^sqlx\" | head; echo ---; fd -t d \"sqlx-postgres\" ~/.cargo/registry/src --max-depth 2 | head)",
+      "Bash(cargo clippy *)"
     ]
   }
 }

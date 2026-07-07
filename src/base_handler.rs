@@ -242,10 +242,20 @@ impl BaseHandler {
         &self.pool
     }
 
-    /// Unicode NFD normalization — decomposes characters then lowercases.
-    /// Useful for matching names with different Unicode representations.
+    /// Accent-insensitive name key: NFD-decompose, DROP combining marks, then
+    /// lowercase — "José Ramírez" and "Jose Ramirez" produce the same key.
+    ///
+    /// NFD alone only equalizes composed vs decomposed representations of the
+    /// SAME accented string; the combining marks survive, so an accented name
+    /// never matched its accent-stripped variant (a common shape across data
+    /// feeds — US sources routinely strip diacritics). Stripping the marks
+    /// after decomposition makes the comparison genuinely accent-insensitive.
     pub fn normalize_name(name: &str) -> String {
-        name.nfd().collect::<String>().to_lowercase()
+        use unicode_normalization::char::is_combining_mark;
+        name.nfd()
+            .filter(|c| !is_combining_mark(*c))
+            .collect::<String>()
+            .to_lowercase()
     }
 
     // ==================== UNIFIED WRITE ====================
