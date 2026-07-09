@@ -17,7 +17,7 @@ use crate::value::DbValue;
 use std::fmt::Write as _;
 use sqlx::postgres::{PgArguments, PgRow};
 use sqlx::query::Query;
-use sqlx::{AssertSqlSafe, PgPool, Postgres};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Row as _};
 use tracing::warn;
 use unicode_normalization::UnicodeNormalization;
 
@@ -522,6 +522,74 @@ impl PgHandler {
 
         tx.commit().await?;
         Ok(result.rows_affected())
+    }
+
+    // ==================== SCALAR READ HELPERS ====================
+
+    /// Run a single-value `SELECT` and return the first column of the single
+    /// matching row, or `None` if no row matched.
+    ///
+    /// Convenience over the `execute_write(WriteOp::Single { .., FetchMode::Optional })`
+    /// → `.optional()?` → `row.get(0)` dance that OLTP `get_*_id` / `get_or_create`
+    /// lookups hand-roll everywhere. Uses `Optional` (not `One`), so an empty
+    /// result is `Ok(None)` rather than an error; a genuine DB failure still
+    /// surfaces as `Err`.
+    pub async fn query_scalar_opt<T>(
+        &self,
+        query: &str,
+        params: Vec<DbValue>,
+    ) -> Result<Option<T>, DbkitError>
+    where
+        T: for<'r> sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>,
+    {
+        let result = self
+            .execute_write(WriteOp::Single {
+                query,
+                params,
+                mode: FetchMode::Optional,
+            })
+            .await?;
+        Ok(result.optional()?.map(|row| row.get(0)))
+    }
+
+    /// Run a single-value `SELECT` (or `INSERT … RETURNING`) that must yield
+    /// exactly one row, and return the first column. Errors if no row matched —
+    /// use [`query_scalar_opt`](Self::query_scalar_opt) when zero rows is valid.
+    pub async fn query_scalar<T>(
+        &self,
+        query: &str,
+        params: Vec<DbValue>,
+    ) -> Result<T, DbkitError>
+    where
+        T: for<'r> sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>,
+    {
+        let result = self
+            .execute_write(WriteOp::Single {
+                query,
+                params,
+                mode: FetchMode::One,
+            })
+            .await?;
+        Ok(result.one()?.get(0))
+    }
+
+    /// Run a `SELECT` and collect the first column of every row into a `Vec`.
+    pub async fn query_col<T>(
+        &self,
+        query: &str,
+        params: Vec<DbValue>,
+    ) -> Result<Vec<T>, DbkitError>
+    where
+        T: for<'r> sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>,
+    {
+        let result = self
+            .execute_write(WriteOp::Single {
+                query,
+                params,
+                mode: FetchMode::All,
+            })
+            .await?;
+        Ok(result.all()?.iter().map(|row| row.get(0)).collect())
     }
 
     // ==================== NATIVE POSTGRES READ ====================
