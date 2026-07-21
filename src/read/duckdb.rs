@@ -16,6 +16,14 @@ use tokio::task;
 /// not `Sync`.
 pub struct DuckEngine {
     conn: Arc<Mutex<::duckdb::Connection>>,
+    /// `search_path` to apply to every connection this engine hands out.
+    ///
+    /// DuckDB's `search_path` (like `USE`) is CONNECTION-scoped, and
+    /// [`ReadEngine::query_arrow`] runs each query on its own `try_clone()`
+    /// connection — so a path set once on the root connection is *gone* by the
+    /// time a query executes. Storing it here lets every clone re-apply it.
+    /// `None` (the default) leaves resolution exactly as DuckDB ships it.
+    search_path: Arc<Mutex<Option<String>>>,
 }
 
 impl DuckEngine {
@@ -29,7 +37,36 @@ impl DuckEngine {
             .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            search_path: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Set the `search_path` applied to **every** connection this engine uses,
+    /// so unqualified table names resolve as configured.
+    ///
+    /// Necessary because DuckDB scopes `search_path`/`USE` to a single
+    /// connection while [`ReadEngine::query_arrow`] executes each query on a
+    /// fresh `try_clone()`. Setting the path once on the root connection has no
+    /// effect on later queries; this stores it so each clone re-applies it.
+    ///
+    /// Pass a comma-separated list, e.g. `"memory.main,pg.public"`.
+    pub fn set_search_path(&self, search_path: impl Into<String>) -> Result<(), DbkitError> {
+        let path = search_path.into();
+        // Validate eagerly on the root connection so a bad path fails here
+        // rather than on every subsequent query.
+        {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?;
+            conn.execute(&format!("SET search_path='{}'", path.replace('\'', "''")), [])
+                .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
+        }
+        *self
+            .search_path
+            .lock()
+            .map_err(|e| DbkitError::LockPoisoned(e.to_string()))? = Some(path);
+        Ok(())
     }
 
     /// Attach a Postgres database so its tables can be queried live — without
@@ -40,6 +77,10 @@ impl DuckEngine {
     /// pre-rewrite zero-copy `ATTACH` path; it does not change the default
     /// catalog, so synced in-memory tables are unaffected. Blocking; intended
     /// for one-time setup.
+    ///
+    /// Unqualified names still won't resolve to Postgres — use
+    /// [`Self::attach_postgres_searchable`] (or [`Self::set_search_path`]) if
+    /// you want `FROM users` to find `pg.public.users`.
     pub fn attach_postgres(&self, connection_string: &str) -> Result<(), DbkitError> {
         let conn = self
             .conn
@@ -53,6 +94,24 @@ impl DuckEngine {
         conn.execute(&format!("ATTACH '{escaped}' AS pg (TYPE POSTGRES)"), [])
             .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
         Ok(())
+    }
+
+    /// [`Self::attach_postgres`] plus a `search_path` that makes the attached
+    /// Postgres tables resolve **unqualified** — `FROM users` finds
+    /// `pg.public.users`.
+    ///
+    /// The path is `memory.main,pg.public`: the local in-memory catalog is
+    /// searched FIRST, so `sync_*`/`load_table` tables keep shadowing Postgres
+    /// and existing behaviour is preserved. Only names that would otherwise
+    /// have errored now resolve to Postgres.
+    ///
+    /// Prefer this when the DuckDB instance exists to query one attached
+    /// Postgres database — writing `pg.public.` in front of every table is
+    /// noisy, and forgetting it produces a confusing
+    /// `Table with name X does not exist! Did you mean "pg.X"?`.
+    pub fn attach_postgres_searchable(&self, connection_string: &str) -> Result<(), DbkitError> {
+        self.attach_postgres(connection_string)?;
+        self.set_search_path("memory.main,pg.public")
     }
 
 }
@@ -78,10 +137,24 @@ impl ReadEngine for DuckEngine {
                 .try_clone()
                 .map_err(|e| DbkitError::DuckDb(e.to_string()))?
         };
+        // `search_path` is CONNECTION-scoped, so the clone above does NOT
+        // inherit one set on the root connection — it must be re-applied here
+        // or unqualified names silently fail to resolve (e.g. an ATTACHed
+        // Postgres table erroring with `Did you mean "pg.X"?`). Cheap: a
+        // settings write on an in-process DB, no I/O.
+        let search_path = self
+            .search_path
+            .lock()
+            .map_err(|e| DbkitError::LockPoisoned(e.to_string()))?
+            .clone();
         let sql = sql.to_string();
         let params = params.to_vec();
 
         task::spawn_blocking(move || {
+            if let Some(path) = search_path {
+                conn.execute(&format!("SET search_path='{}'", path.replace('\'', "''")), [])
+                    .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
+            }
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| DbkitError::DuckDb(e.to_string()))?;
@@ -195,6 +268,67 @@ mod tests {
         );
         // Dropping a never-loaded table is a no-op, not an error.
         eng.drop_table("never_loaded").await.unwrap();
+    }
+
+    /// `search_path` is CONNECTION-scoped, so a path set only on the root
+    /// connection is lost when `query_arrow` clones — which silently broke
+    /// unqualified reads against an ATTACHed catalog. Pin that
+    /// `set_search_path` survives the clone.
+    ///
+    /// Uses a second in-memory catalog (ATTACH ':memory:') as a stand-in for
+    /// the Postgres attachment so the test needs no live database.
+    #[tokio::test]
+    async fn search_path_survives_the_per_query_connection_clone() {
+        let eng = DuckEngine::new_in_memory().unwrap();
+        {
+            let conn = eng.conn.lock().unwrap();
+            conn.execute_batch(
+                "ATTACH ':memory:' AS other; \
+                 CREATE TABLE other.main.widgets AS SELECT * FROM range(3) r(a);",
+            )
+            .unwrap();
+        }
+
+        // Unqualified resolution fails before a search path is configured.
+        assert!(
+            eng.query_arrow("SELECT count(*) FROM widgets", &[])
+                .await
+                .is_err(),
+            "unqualified name must not resolve without a search_path"
+        );
+
+        eng.set_search_path("memory.main,other.main").unwrap();
+
+        let batches = eng
+            .query_arrow("SELECT count(*) AS n FROM widgets", &[])
+            .await
+            .expect("search_path must be re-applied on the cloned connection");
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 3);
+
+        // Local catalog is searched FIRST, so a same-named local table still
+        // shadows the attached one (sync_*/load_table behaviour preserved).
+        {
+            let conn = eng.conn.lock().unwrap();
+            conn.execute_batch("CREATE TABLE widgets AS SELECT * FROM range(99) r(a)")
+                .unwrap();
+        }
+        let batches = eng
+            .query_arrow("SELECT count(*) AS n FROM widgets", &[])
+            .await
+            .unwrap();
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 99, "local catalog must shadow the attached one");
     }
 }
 

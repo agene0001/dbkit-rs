@@ -215,6 +215,26 @@ impl BaseHandler {
         })
     }
 
+    /// Like [`Self::with_duckdb_attached_postgres`], but the attached Postgres
+    /// tables also resolve **unqualified** — `FROM users` finds
+    /// `pg.public.users`.
+    ///
+    /// Uses the `memory.main,pg.public` search path, so `sync_*` tables are
+    /// searched first and keep shadowing Postgres; only names that would
+    /// otherwise error now reach Postgres.
+    #[cfg(feature = "duckdb")]
+    pub fn with_duckdb_attached_postgres_searchable(
+        pool: AnyPool,
+        pg_connection_string: &str,
+    ) -> Result<Self, DbkitError> {
+        let engine = crate::read::duckdb::DuckEngine::new_in_memory()?;
+        engine.attach_postgres_searchable(pg_connection_string)?;
+        Ok(Self {
+            pool,
+            read_engine: Some(Box::new(engine)),
+        })
+    }
+
     /// Create a handler with a DataFusion analytical read engine.
     #[cfg(feature = "datafusion")]
     pub fn with_datafusion(pool: AnyPool) -> Result<Self, DbkitError> {
