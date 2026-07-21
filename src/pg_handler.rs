@@ -234,6 +234,27 @@ impl PgHandler {
         })
     }
 
+    /// Like [`Self::with_duckdb_attached_postgres`], but the attached Postgres
+    /// tables also resolve **unqualified** — `FROM users` finds
+    /// `pg.public.users`, no `pg.public.` prefix required.
+    ///
+    /// Uses the `memory.main,pg.public` search path, so locally synced tables
+    /// are searched first and keep shadowing Postgres; only names that would
+    /// otherwise error now reach Postgres. Prefer this when the DuckDB instance
+    /// exists to query one attached Postgres database.
+    #[cfg(feature = "duckdb")]
+    pub fn with_duckdb_attached_postgres_searchable(
+        pool: PgPool,
+        pg_connection_string: &str,
+    ) -> Result<Self, DbkitError> {
+        let duck = DuckEngine::new_in_memory()?;
+        duck.attach_postgres_searchable(pg_connection_string)?;
+        Ok(Self {
+            pool,
+            duck: Some(duck),
+        })
+    }
+
     /// Whether a DuckDB read engine is attached.
     pub fn has_read_engine(&self) -> bool {
         #[cfg(feature = "duckdb")]
