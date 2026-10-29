@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.4]
+
+### Changed
+
+- **Dependency refresh.** Bumped `tokio` (1.54.1), `reqwest` (0.13.5),
+  `async-trait` (0.1.92) and `unicode-normalization` (0.1.26), plus a
+  `cargo update` of transitive dependencies.
+- **Analytical engines stay on arrow 58.** `duckdb` 1.20000 moved to arrow 60
+  while `datafusion` 55 is on arrow 59, which would split the shared arrow crate
+  and break builds enabling both engines. `duckdb` is now capped at `<1.20000`
+  (resolves to 1.10506.1) and `datafusion` takes 54.1.0; `arrow` and
+  `serde_arrow` are unchanged. These move together once datafusion reaches
+  arrow 60.
+
 ## [0.5.1]
 
 ### Fixed

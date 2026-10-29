@@ -6,7 +6,13 @@
       "Bash(tokei ~/OneDrive/Desktop/cs_projects/dbkit-rs/src)",
       "Bash(fd -e rs . ~/OneDrive/Desktop/cs_projects/dbkit-rs/src ~/OneDrive/Desktop/cs_projects/dbkit-rs/tests -x wc -l {})",
       "Bash(ls ~/.cargo/registry/src/*/ | grep -E \"^sqlx\" | head; echo ---; fd -t d \"sqlx-postgres\" ~/.cargo/registry/src --max-depth 2 | head)",
-      "Bash(cargo clippy *)"
+      "Bash(cargo clippy *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo add *)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(cd \"/Volumes/Crucial X9/cs_projects/dbkit\" && rm -f bench/Cargo.lock && git pull --ff-only origin master 2>&1 | tail -8 && echo \"=== now at ===\" && git log --oneline -2 && echo \"=== status ===\" && git status -sb | head -3)"
     ]
   }
 }
